@@ -2,13 +2,14 @@
     "FeishuBot": {
         "name": "飞书机器人",
         "description": "飞书机器人双向通信插件，基于 WebSocket 长连接无需公网IP，支持影视搜索、订阅下载与消息交互",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "icon": "feishu.png",
         "author": "MoviePilot-Community",
         "level": 1,
         "color": "#2B5AED",
         "history": {
-            "v2.0.0": "架构重构：使用飞书 WebSocket 长连接替代 Webhook，无需公网IP；支持快捷文本交互；自动记录会话ID",
+            "v2.1.0": "内置 Protobuf 解析器，修复二进制帧解码错误；支持消息分片重组；无需任何额外依赖即可运行",
+            "v2.0.0": "架构重构：使用飞书 WebSocket 长连接替代 Webhook，无需公网IP",
             "v1.0.0": "首个版本：基于 Webhook 的双向通信"
         }
     }
