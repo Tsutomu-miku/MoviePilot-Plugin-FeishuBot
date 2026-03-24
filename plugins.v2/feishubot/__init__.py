@@ -1,8 +1,9 @@
 """
-飞书机器人双向通信插件（长连接版 v2.2.0）
+飞书机器人双向通信插件（长连接版 v2.3.0）
 使用飞书官方 WebSocket 长连接，无需公网 IP / Webhook
 内置 Protobuf 解析器，无需额外安装 protobuf 依赖
 修复 SDK 模式下 "event loop is already running" 问题
+修复 MediaChain API 调用错误
 """
 import asyncio
 import json
@@ -162,7 +163,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书机器人双向通信插件，基于长连接无需公网IP，支持影视搜索、订阅下载与消息交互"
     plugin_icon = "feishu.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     plugin_author = "MoviePilot-Community"
     plugin_config_prefix = "feishubot_"
     plugin_order = 20
@@ -681,14 +682,27 @@ class FeishuBot(_PluginBase):
         self._send_card(chat_id, card, msg_id)
 
     def _cmd_search(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
+        """
+        搜索影视
+        使用 MediaChain().search(title) -> (MetaBase, List[MediaInfo])
+        """
+        if not keyword:
+            return
         self._send_text(chat_id, f"🔍 正在搜索: {keyword} ...", msg_id)
         try:
             from app.chain.media import MediaChain
+
             mc = MediaChain()
-            meta = mc.recognize_by_meta(keyword)
-            medias = [meta] if meta and meta.tmdb_info else mc.search(title=keyword)
+            # search() 返回 Tuple[Optional[MetaBase], List[MediaInfo]]
+            meta, medias = mc.search(title=keyword)
+
+            if not meta or not meta.name:
+                self._send_text(chat_id, f"😔 无法识别: {keyword}")
+                return
             if not medias:
-                self._send_text(chat_id, f"😔 未找到: {keyword}"); return
+                self._send_text(chat_id, f"😔 未找到 {meta.name} 的相关结果")
+                return
+
             medias = medias[:6]
             self._search_cache[user_id] = medias
             self._send_card(chat_id, self._build_search_card(medias, keyword))
@@ -699,7 +713,7 @@ class FeishuBot(_PluginBase):
     def _build_search_card(self, medias: list, keyword: str) -> dict:
         elements = []
         for i, media in enumerate(medias[:6]):
-            title = getattr(media, "title", "") or "未知"
+            title = getattr(media, "title", None) or getattr(media, "title_year", "") or "未知"
             year = getattr(media, "year", "")
             rating = getattr(media, "vote_average", "")
             mtype = "电影" if getattr(media, "type", None) == MediaType.MOVIE else "电视剧"
@@ -722,13 +736,32 @@ class FeishuBot(_PluginBase):
         }
 
     def _cmd_subscribe(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
+        """
+        订阅影视
+        先通过 search 识别，再取第一个结果调 SubscribeChain.add()
+        """
+        if not keyword:
+            return
         self._send_text(chat_id, f"📥 正在订阅: {keyword} ...", msg_id)
         try:
             from app.chain.media import MediaChain
-            meta = MediaChain().recognize_by_meta(keyword)
-            if not meta or not meta.tmdb_info:
-                self._send_text(chat_id, f"\u274c 未识别到: {keyword}"); return
-            self._subscribe_media(meta, chat_id, msg_id)
+            from app.core.metainfo import MetaInfo as MetaInfoFunc
+
+            mc = MediaChain()
+            # 先创建 MetaBase 再识别
+            metainfo = MetaInfoFunc(title=keyword)
+            mediainfo = mc.recognize_by_meta(metainfo)
+
+            if not mediainfo:
+                # 识别失败，尝试搜索
+                meta, medias = mc.search(title=keyword)
+                if medias:
+                    mediainfo = medias[0]
+                else:
+                    self._send_text(chat_id, f"\u274c 未识别到: {keyword}")
+                    return
+
+            self._subscribe_media(mediainfo, chat_id, msg_id)
         except Exception as e:
             logger.error(f"飞书订阅异常: {e}", exc_info=True)
             self._send_text(chat_id, f"\u26a0\ufe0f 订阅出错: {e}")
@@ -736,11 +769,17 @@ class FeishuBot(_PluginBase):
     def _subscribe_media(self, media, chat_id: str, msg_id: str = None):
         try:
             from app.chain.subscribe import SubscribeChain
-            title = getattr(media, "title", "未知")
-            year = getattr(media, "year", "")
+            title = getattr(media, "title", None) or "未知"
+            year = getattr(media, "year", None) or ""
             tmdb_id = getattr(media, "tmdb_id", None)
-            mtype = getattr(media, "type", MediaType.MOVIE)
-            sid, msg = SubscribeChain().add(title=title, year=year, mtype=mtype, tmdbid=tmdb_id, userid="feishu")
+            mtype = getattr(media, "type", None) or MediaType.MOVIE
+            sid, err_msg = SubscribeChain().add(
+                title=title,
+                year=str(year),
+                mtype=mtype,
+                tmdbid=tmdb_id,
+                userid="feishu",
+            )
             if sid:
                 mt = "电影" if mtype == MediaType.MOVIE else "电视剧"
                 card = {
@@ -750,7 +789,7 @@ class FeishuBot(_PluginBase):
                 }
                 self._send_card(chat_id, card)
             else:
-                self._send_text(chat_id, f"\u26a0\ufe0f 订阅失败: {msg or '未知原因'}")
+                self._send_text(chat_id, f"\u26a0\ufe0f 订阅失败: {err_msg or '未知原因'}")
         except Exception as e:
             self._send_text(chat_id, f"\u26a0\ufe0f 订阅出错: {e}")
 
@@ -794,12 +833,12 @@ class FeishuBot(_PluginBase):
         cached = self._search_cache.get(user_id, [])
         if 0 < idx <= len(cached):
             media = cached[idx-1]
-            title = getattr(media, "title", "未知")
-            mtype = getattr(media, "type", MediaType.MOVIE)
+            title = getattr(media, "title", None) or "未知"
             self._send_text(chat_id, f"🔍 搜索 {title} 的资源...", msg_id)
             try:
                 from app.chain.search import SearchChain
-                contexts = SearchChain().search_by_title(title=title, mtype=mtype)
+                # search_by_title(title, page, site) — 没有 mtype 参数
+                contexts = SearchChain().search_by_title(title=title)
                 if not contexts:
                     self._send_text(chat_id, f"😔 未找到 {title} 的资源"); return
                 self._search_cache[f"{user_id}_res"] = contexts[:10]
