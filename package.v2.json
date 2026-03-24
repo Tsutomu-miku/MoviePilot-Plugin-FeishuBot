@@ -1,0 +1,14 @@
+{
+    "FeishuBot": {
+        "name": "飞书机器人",
+        "description": "飞书机器人双向通信插件，支持影视搜索、订阅下载与消息交互卡片",
+        "version": "1.0.0",
+        "icon": "feishu.png",
+        "author": "MoviePilot-Community",
+        "level": 1,
+        "color": "#2B5AED",
+        "history": {
+            "v1.0.0": "首个版本发布：支持飞书双向消息、影视搜索、订阅下载、交互式卡片"
+        }
+    }
+}
