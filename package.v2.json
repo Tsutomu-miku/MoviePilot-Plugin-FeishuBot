@@ -3,7 +3,7 @@
     "name": "飞书机器人",
     "description": "飞书机器人通知与交互插件，支持 Agent 智能对话模式",
     "labels": "消息通知",
-    "version": "4.0.0",
+    "version": "4.0.1",
     "icon": "https://open.feishu.cn/favicon.ico",
     "author": "Tsutomu",
     "level": 1,
@@ -18,7 +18,8 @@
       "v3.3.0": "版本号三处同步修复 + 全面对齐 plugin_version/package/docstring",
       "v3.4.0": "全面增强诊断日志 + 新增运行状态仪表板 + 飞书Token连通性验证",
       "v3.5.0": "修复 get_page VCard 组件崩溃 + 事件/消息顶层异常捕获 + 计数器安全访问",
-      "v4.0.0": "新增 WebSocket 长连接收消息，替代已失效的 HTTP 回调方式"
+      "v4.0.0": "新增 WebSocket 长连接收消息，替代已失效的 HTTP 回调方式",
+      "v4.0.1": "修复 WebSocket 线程与 FastAPI/uvicorn 事件循环冲突"
     }
   }
 }
