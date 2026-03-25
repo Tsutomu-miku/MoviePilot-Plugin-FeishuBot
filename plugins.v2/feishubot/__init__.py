@@ -1,5 +1,11 @@
 """
-飞书机器人插件 v3.1.1 — MoviePilot Agent Mode
+飞书机器人插件 v3.2.0 — MoviePilot Agent Mode
+
+修复记录 (v3.2.0):
+- 增强诊断日志: 所有关键路径添加 instance id 追踪
+- 拆分路由日志避免 MoviePilot UI 截断
+- Agent 处理添加耗时统计
+- stop_service 日志升级为 warning 级别
 
 修复记录 (v3.1.1):
 - 修复 Agent 模式因 stop_service 后运行时对象丢失导致回退传统模式
@@ -572,8 +578,8 @@ class FeishuBot(_PluginBase):
                 )
                 self._conversations = _ConversationManager(_AGENT_SYSTEM_PROMPT)
                 logger.info(
-                    f"飞书 Agent 模式已启用 ✓ 模型: "
-                    f"{self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL}"
+                    f"飞书 Agent 模式已启用 ✓ inst={id(self):#x}, "
+                    f"模型: {self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL}"
                 )
             except Exception as e:
                 logger.error(f"飞书 Agent 初始化失败: {e}", exc_info=True)
@@ -582,7 +588,7 @@ class FeishuBot(_PluginBase):
         elif self._llm_enabled:
             logger.warning("飞书 AI Agent 已启用但 API Key 未配置，回退到传统模式")
         else:
-            logger.info("飞书传统模式（AI Agent 未启用）")
+            logger.info(f"飞书传统模式（AI Agent 未启用）inst={id(self):#x}")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -593,10 +599,11 @@ class FeishuBot(_PluginBase):
 
     def stop_service(self):
         """清理运行时资源，防止插件重载时 '占用' 冲突"""
-        logger.info(
+        logger.warning(
             f"飞书机器人 stop_service 被调用 "
-            f"(llm_client={'有' if self._llm_client else '无'}, "
-            f"feishu={'有' if self._feishu else '无'})"
+            f"inst={id(self):#x}, "
+            f"llm_client={'有' if self._llm_client else '无'}, "
+            f"feishu={'有' if self._feishu else '无'}"
         )
         self._llm_client = None
         self._conversations = None
@@ -643,7 +650,7 @@ class FeishuBot(_PluginBase):
                 recovered.append("conversations")
 
         if recovered:
-            logger.warning(f"飞书运行时对象已自动恢复: {recovered}")
+            logger.warning(f"飞书运行时对象已自动恢复: inst={id(self):#x}, {recovered}")
 
     # ══════════════════════════════════════════════════════════════════════
     #  API 端点
@@ -715,12 +722,12 @@ class FeishuBot(_PluginBase):
             return
 
         is_agent = self._llm_client is not None and self._conversations is not None
+        logger.info(f"飞书收到: inst={id(self):#x}, user={user_id}, text={text[:80]}")
         logger.info(
-            f"飞书收到: user={user_id}, text={text[:80]}, "
-            f"agent={'ON' if is_agent else 'OFF'}, "
+            f"飞书路由: agent={'ON' if is_agent else 'OFF'}, "
             f"llm_enabled={self._llm_enabled}, "
             f"llm_client={type(self._llm_client).__name__}, "
-            f"conversations={type(self._conversations).__name__}"
+            f"conv={type(self._conversations).__name__}"
         )
 
         # ── 始终可用的指令 ──
@@ -758,6 +765,8 @@ class FeishuBot(_PluginBase):
 
     def _agent_handle(self, text: str, chat_id: str, msg_id: str, user_id: str):
         """Agent 入口：构建上下文 → 循环 → 发送回复 → 保存历史"""
+        import time as _time
+        _t0 = _time.monotonic()
         lock = self._get_user_lock(user_id)
         if not lock.acquire(blocking=False):
             self._feishu.send_text(chat_id, "⏳ 上一个请求还在处理中，请稍候...")
@@ -784,6 +793,8 @@ class FeishuBot(_PluginBase):
             logger.error(f"Agent 异常: {e}", exc_info=True)
             self._feishu.send_text(chat_id, f"⚠️ AI 处理出错: {e}")
         finally:
+            _elapsed = _time.monotonic() - _t0
+            logger.info(f"[Agent] 处理完成: user={user_id}, elapsed={_elapsed:.1f}s")
             lock.release()
 
     def _agent_loop(
