@@ -1,5 +1,11 @@
 """
-飞书机器人插件 v3.1.0 — MoviePilot Agent Mode
+飞书机器人插件 v3.1.1 — MoviePilot Agent Mode
+
+修复记录 (v3.1.1):
+- 修复 Agent 模式因 stop_service 后运行时对象丢失导致回退传统模式
+- 新增 _ensure_runtime_ready 惰性恢复机制防御生命周期异常
+- 修复群聊 @提及标记未清理导致消息包含占位符
+- stop_service 新增日志输出便于排查生命周期问题
 
 修复记录 (v3.1.0):
 - 修复 get_command/get_page 返回 None 导致 MoviePilot 加载异常（插件占用）
@@ -494,7 +500,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -587,12 +593,57 @@ class FeishuBot(_PluginBase):
 
     def stop_service(self):
         """清理运行时资源，防止插件重载时 '占用' 冲突"""
+        logger.info(
+            f"飞书机器人 stop_service 被调用 "
+            f"(llm_client={'有' if self._llm_client else '无'}, "
+            f"feishu={'有' if self._feishu else '无'})"
+        )
         self._llm_client = None
         self._conversations = None
         self._feishu = None
         self._search_cache = None
         self._resource_cache = None
         self._user_locks = None
+
+    def _ensure_runtime_ready(self):
+        """
+        惰性恢复运行时对象。
+
+        防御场景:
+        - get_api() 绑定了旧实例，而新实例的 stop_service 又被调用
+        - MoviePilot 生命周期管理导致运行时对象意外丢失
+        - 插件重载时 stop_service 被调用但 API 端点仍指向旧实例
+        """
+        recovered = []
+
+        if self._feishu is None and self._app_id:
+            self._feishu = _FeishuAPI(self._app_id, self._app_secret)
+            recovered.append("feishu")
+
+        if self._search_cache is None:
+            self._search_cache = {}
+        if self._resource_cache is None:
+            self._resource_cache = {}
+        if self._user_locks is None:
+            self._user_locks = {}
+
+        if self._llm_enabled and self._openrouter_key:
+            if self._llm_client is None:
+                try:
+                    self._llm_client = _OpenRouterClient(
+                        api_key=self._openrouter_key,
+                        model=self._openrouter_model,
+                    )
+                    recovered.append("llm_client")
+                except Exception as e:
+                    logger.error(f"Agent LLM 客户端恢复失败: {e}")
+
+            if self._conversations is None:
+                self._conversations = _ConversationManager(_AGENT_SYSTEM_PROMPT)
+                recovered.append("conversations")
+
+        if recovered:
+            logger.warning(f"飞书运行时对象已自动恢复: {recovered}")
 
     # ══════════════════════════════════════════════════════════════════════
     #  API 端点
@@ -612,6 +663,10 @@ class FeishuBot(_PluginBase):
         data = request_data or {}
         if data.get("type") == "url_verification":
             return {"challenge": data.get("challenge", "")}
+
+        # 确保运行时对象可用（防御 stop_service 后仍有请求到达）
+        self._ensure_runtime_ready()
+
         if data.get("type") == "card.action.trigger":
             return self._handle_card_action(data)
 
@@ -635,14 +690,27 @@ class FeishuBot(_PluginBase):
         sender = event.get("sender", {}).get("sender_id", {})
         user_id = sender.get("open_id", "")
 
+        # 确保运行时对象可用（后台线程可能在 stop_service 后执行）
+        self._ensure_runtime_ready()
+
         if msg_type != "text":
-            self._feishu.send_text(chat_id, "暂时只支持文字消息哦~")
+            if self._feishu:
+                self._feishu.send_text(chat_id, "暂时只支持文字消息哦~")
             return
 
         try:
             text = _json.loads(msg.get("content", "{}")).get("text", "").strip()
         except Exception:
             text = ""
+
+        # ── 清理飞书 @提及标记（群聊中会包含 @_user_1 等占位符）──
+        mentions = msg.get("mentions")
+        if mentions:
+            for m in mentions:
+                key = m.get("key", "")
+                if key:
+                    text = text.replace(key, "").strip()
+
         if not text:
             return
 
@@ -650,6 +718,7 @@ class FeishuBot(_PluginBase):
         logger.info(
             f"飞书收到: user={user_id}, text={text[:80]}, "
             f"agent={'ON' if is_agent else 'OFF'}, "
+            f"llm_enabled={self._llm_enabled}, "
             f"llm_client={type(self._llm_client).__name__}, "
             f"conversations={type(self._conversations).__name__}"
         )
@@ -662,7 +731,8 @@ class FeishuBot(_PluginBase):
         if text in ("/clear", "/清除", "清除对话", "重新开始"):
             if self._conversations:
                 self._conversations.clear(user_id)
-            self._feishu.send_text(chat_id, "🗑️ 对话已清除")
+            if self._feishu:
+                self._feishu.send_text(chat_id, "🗑️ 对话已清除")
             return
 
         # ── Agent 模式：一切交给 LLM ──
