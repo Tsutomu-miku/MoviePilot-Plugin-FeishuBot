@@ -1,5 +1,5 @@
 """
-飞书机器人插件 v4.0.1 — MoviePilot Agent Mode + WebSocket 长连接
+飞书机器人插件 v4.0.0 — MoviePilot Agent Mode + WebSocket 长连接
 
 修复记录 (v4.0.0):
 - **核心修复**: 新增 WebSocket 长连接收消息，替代已失效的 HTTP 回调方式
@@ -8,12 +8,6 @@
 - 支持自动重连、Protobuf 解析、心跳保活
 - 保留 HTTP 回调端点作为备用方案
 - 新增 `use_ws` 配置开关（默认开启）
-
-修复记录 (v4.0.1):
-- 修复 WebSocket 线程与 FastAPI/uvicorn 事件循环冲突
-  ("This event loop is already running")
-- 后台线程创建独立 asyncio event loop 并 patch SDK 模块级变量
-- WebSocket 客户端改在线程内创建，确保使用正确的 loop
 
 修复记录 (v3.5.0):
 - 修复 get_page 使用不支持的 VCard 组件导致 MoviePilot 插件加载失败
@@ -549,7 +543,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "4.0.1"
+    plugin_version = "4.0.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -728,9 +722,18 @@ class FeishuBot(_PluginBase):
             return
 
         try:
+            # 构建事件处理器
+            event_handler = self._build_event_handler()
+
+            # 创建 lark-oapi WebSocket 客户端
+            self._ws_client = LarkWSClient(
+                self._app_id,
+                self._app_secret,
+                event_handler=event_handler,
+                log_level=lark.LogLevel.INFO,
+            )
+
             # 在后台线程中启动（ws.Client.start() 是阻塞的）
-            # 注意: 客户端实例必须在后台线程内创建，
-            # 因为需要先为线程设置独立的 event loop 再初始化 SDK
             self._ws_running = True
             self._ws_thread = threading.Thread(
                 target=self._ws_run_loop,
@@ -749,41 +752,22 @@ class FeishuBot(_PluginBase):
 
     def _ws_run_loop(self):
         """在后台线程中运行 WebSocket 客户端（带自动重连）"""
-        import asyncio as _asyncio
-
-        # ━━ 关键修复: 为此线程创建独立的 asyncio 事件循环 ━━
-        # MoviePilot 基于 FastAPI/uvicorn，主线程已有 running event loop。
-        # lark-oapi SDK 的 ws.Client 在模块级别执行:
-        #     loop = asyncio.get_event_loop()
-        # 然后在 start() 中调用 loop.run_until_complete()，
-        # 如果 loop 是主线程那个已在运行的 loop，就会报
-        # "This event loop is already running"。
-        #
-        # 解决方案: 在后台线程中创建全新的 event loop，
-        # 并 patch SDK 的模块级 loop 变量指向新 loop。
-        _new_loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(_new_loop)
-
-        try:
-            import lark_oapi.ws.client as _ws_mod
-            _ws_mod.loop = _new_loop
-            logger.info(
-                f"飞书 WebSocket 线程已创建独立 event loop "
-                f"(id={id(_new_loop):#x}), 已 patch SDK"
-            )
-        except Exception as e:
-            logger.error(f"Patch lark-oapi event loop 失败: {e}", exc_info=True)
+        import asyncio
 
         while self._ws_running:
+            new_loop = None
             try:
-                # 在线程内创建客户端（确保使用 patched loop）
-                event_handler = self._build_event_handler()
-                self._ws_client = LarkWSClient(
-                    self._app_id,
-                    self._app_secret,
-                    event_handler=event_handler,
-                    log_level=lark.LogLevel.INFO,
-                )
+                # ── 关键修复: 为当前线程创建全新的 event loop ──
+                # MoviePilot (FastAPI/Uvicorn) 主线程已有 event loop，
+                # lark-oapi SDK 内部 start() 调用 loop.run_until_complete()，
+                # 如果复用主线程 loop 会报 "This event loop is already running"。
+                # 解决方案: 在后台线程创建独立 loop 并替换 SDK 模块级变量。
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+
+                # 替换 lark-oapi SDK 内部使用的模块级 event loop
+                import lark_oapi.ws.client as _ws_mod
+                _ws_mod.loop = new_loop
 
                 logger.info("飞书 WebSocket 长连接线程启动")
                 self._ws_connected = True
@@ -792,17 +776,31 @@ class FeishuBot(_PluginBase):
                 logger.error(f"飞书 WebSocket 长连接异常退出: {e}", exc_info=True)
             finally:
                 self._ws_connected = False
+                if new_loop is not None:
+                    try:
+                        new_loop.close()
+                    except Exception:
+                        pass
 
             if self._ws_running:
                 import time
                 logger.warning("飞书 WebSocket 长连接断开，10 秒后尝试重连...")
                 time.sleep(10)
 
-        # 清理 event loop
-        try:
-            _new_loop.close()
-        except Exception:
-            pass
+                # 重新创建客户端实例
+                try:
+                    event_handler = self._build_event_handler()
+                    self._ws_client = LarkWSClient(
+                        self._app_id,
+                        self._app_secret,
+                        event_handler=event_handler,
+                        log_level=lark.LogLevel.INFO,
+                    )
+                except Exception as e:
+                    logger.error(f"WebSocket 客户端重建失败: {e}", exc_info=True)
+                    import time
+                    time.sleep(30)
+
         logger.info("飞书 WebSocket 长连接线程已退出")
 
     def _build_event_handler(self) -> "EventDispatcherHandler":
@@ -1416,7 +1414,7 @@ class FeishuBot(_PluginBase):
         if not keyword:
             return
         self._feishu.send_text(chat_id, f"🔍 正在搜索: {keyword} ...")
-        result =self._tool_search_media(keyword, user_id)
+        result = self._tool_search_media(keyword, user_id)
         if result.get("error"):
             self._feishu.send_text(chat_id, f"⚠️ {result['error']}")
             return
