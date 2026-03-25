@@ -1,5 +1,11 @@
 """
-飞书机器人插件 v3.0.1 — MoviePilot Agent Mode
+飞书机器人插件 v3.1.0 — MoviePilot Agent Mode
+
+修复记录 (v3.1.0):
+- 修复 get_command/get_page 返回 None 导致 MoviePilot 加载异常（插件占用）
+- 修复旧配置 default_chat_id 键名不兼容
+- 修复搜索结果中字符串对象被误当 MediaInfo 使用（str.title 方法引用 Bug）
+- 类级别可变对象改为 None，init_plugin 中实例化
 
 修复记录 (v3.0.1):
 - 合并为单文件结构，兼容 MoviePilot 插件动态加载机制
@@ -488,7 +494,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "3.0.1"
+    plugin_version = "3.1.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -509,9 +515,9 @@ class FeishuBot(_PluginBase):
     _feishu: Optional[_FeishuAPI] = None
     _llm_client: Optional[_OpenRouterClient] = None
     _conversations: Optional[_ConversationManager] = None
-    _search_cache: dict = {}
-    _resource_cache: dict = {}
-    _user_locks: dict = {}
+    _search_cache: Optional[dict] = None
+    _resource_cache: Optional[dict] = None
+    _user_locks: Optional[dict] = None
 
     _MAX_AGENT_ITERATIONS = 10
 
@@ -525,7 +531,7 @@ class FeishuBot(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._app_id = config.get("app_id", "")
             self._app_secret = config.get("app_secret", "")
-            self._chat_id = config.get("chat_id", "")
+            self._chat_id = config.get("chat_id", "") or config.get("default_chat_id", "")
             self._msgtypes = config.get("msgtypes") or []
 
             llm_raw = config.get("llm_enabled")
@@ -577,10 +583,16 @@ class FeishuBot(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def stop_service(self):
-        pass
+        """清理运行时资源，防止插件重载时 '占用' 冲突"""
+        self._llm_client = None
+        self._conversations = None
+        self._feishu = None
+        self._search_cache = None
+        self._resource_cache = None
+        self._user_locks = None
 
     # ══════════════════════════════════════════════════════════════════════
     #  API 端点
@@ -635,7 +647,12 @@ class FeishuBot(_PluginBase):
             return
 
         is_agent = self._llm_client is not None and self._conversations is not None
-        logger.info(f"飞书收到: user={user_id}, text={text}, agent={is_agent}")
+        logger.info(
+            f"飞书收到: user={user_id}, text={text[:80]}, "
+            f"agent={'ON' if is_agent else 'OFF'}, "
+            f"llm_client={type(self._llm_client).__name__}, "
+            f"conversations={type(self._conversations).__name__}"
+        )
 
         # ── 始终可用的指令 ──
         if text.startswith("/status") or text.startswith("/状态"):
@@ -663,6 +680,8 @@ class FeishuBot(_PluginBase):
     # ══════════════════════════════════════════════════════════════════════
 
     def _get_user_lock(self, user_id: str) -> threading.Lock:
+        if self._user_locks is None:
+            self._user_locks = {}
         if user_id not in self._user_locks:
             self._user_locks[user_id] = threading.Lock()
         return self._user_locks[user_id]
@@ -813,17 +832,21 @@ class FeishuBot(_PluginBase):
         try:
             from app.chain.media import MediaChain
             result = MediaChain().search(title=keyword)
-            if not isinstance(result, tuple) or len(result) != 2:
+            # 兼容不同 MoviePilot 版本的返回格式
+            if isinstance(result, tuple) and len(result) == 2:
+                meta, medias = result
+            elif isinstance(result, list):
+                meta, medias = None, result
+            else:
                 return {"error": "搜索返回格式异常", "results": []}
-
-            meta, medias = result
             if not medias:
                 name = getattr(meta, "name", keyword) if meta else keyword
                 return {"keyword": keyword, "results": [], "message": f"未找到「{name}」"}
 
             valid = []
             for i, m in enumerate(medias[:8]):
-                if not hasattr(m, "title"):
+                # 跳过字符串（str.title 是方法，会被误判为有 title 属性）
+                if isinstance(m, str) or not hasattr(m, "tmdb_id"):
                     continue
                 raw_type = getattr(m, "type", None)
                 if hasattr(raw_type, "value"):
@@ -839,7 +862,8 @@ class FeishuBot(_PluginBase):
                     "overview": (getattr(m, "overview", "") or "")[:120],
                     "tmdb_id": getattr(m, "tmdb_id", ""),
                 })
-            self._search_cache[user_id] = medias[:8]
+            if self._search_cache is not None:
+                self._search_cache[user_id] = medias[:8]
             return {"keyword": keyword, "total_found": len(medias), "results": valid}
         except Exception as e:
             logger.error(f"search_media 异常: {e}", exc_info=True)
@@ -857,8 +881,11 @@ class FeishuBot(_PluginBase):
                 result = MediaChain().search(title=keyword)
                 if isinstance(result, tuple) and len(result) == 2:
                     _, medias = result
-                    if medias and hasattr(medias[0], "title"):
-                        title = medias[0].title or keyword
+                    if medias and not isinstance(medias[0], str) and hasattr(medias[0], "tmdb_id"):
+                        # 安全取 title 属性（避免 str.title 方法引用）
+                        raw_title = getattr(medias[0], "title", None)
+                        if isinstance(raw_title, str) and raw_title:
+                            title = raw_title
             except Exception:
                 pass
 
@@ -883,7 +910,8 @@ class FeishuBot(_PluginBase):
                     "seeders": getattr(t, "seeders", ""),
                     "tags": _extract_tags(tname),
                 })
-            self._resource_cache[user_id] = contexts[:20]
+            if self._resource_cache is not None:
+                self._resource_cache[user_id] = contexts[:20]
             return {
                 "keyword": keyword, "title": title,
                 "total_found": len(contexts), "showing": len(results),
@@ -895,7 +923,7 @@ class FeishuBot(_PluginBase):
 
     def _tool_download_resource(self, index: int, confirmed: bool, user_id: str) -> dict:
         """下载资源 — confirmed=false 仅返回详情，confirmed=true 才执行下载"""
-        cached = self._resource_cache.get(user_id, [])
+        cached = (self._resource_cache or {}).get(user_id, [])
         if not cached:
             return {"error": "没有缓存的资源列表，请先调用 search_resources"}
         if index < 0 or index >= len(cached):
@@ -933,7 +961,7 @@ class FeishuBot(_PluginBase):
     def _tool_subscribe_media(self, index: Optional[int], keyword: Optional[str], user_id: str) -> dict:
         mediainfo = None
         if index is not None:
-            cached = self._search_cache.get(user_id, [])
+            cached = (self._search_cache or {}).get(user_id, [])
             if 0 <= index < len(cached):
                 mediainfo = cached[index]
 
@@ -1055,6 +1083,8 @@ class FeishuBot(_PluginBase):
     def _cmd_status(self, chat_id: str, msg_id: str):
         model = self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL
         conv = self._conversations.active_users if self._conversations else 0
+        cache_media = len(self._search_cache) if self._search_cache else 0
+        cache_res = len(self._resource_cache) if self._resource_cache else 0
         self._feishu.send_text(
             chat_id,
             f"🔧 插件诊断 v{self.plugin_version}\n"
@@ -1195,7 +1225,7 @@ class FeishuBot(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        return []
 
     # ══════════════════════════════════════════════════════════════════════
     #  事件通知
