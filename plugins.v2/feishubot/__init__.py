@@ -1,33 +1,33 @@
+"""
+飞书机器人插件 v2.5.0 — MoviePilot Agent Mode
+当启用 AI 后，插件变为完整 Agent：LLM 通过多轮 tool calling
+自主编排搜索、筛选、推荐、下载、订阅等全部操作。
+"""
 import json as _json
 import re
 import threading
+import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple
 
-import pytz
 import requests
 from app.core.config import settings
 from app.core.event import eventmanager, Event
-from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import MediaInfo, MediaType
+from app.schemas import MediaType
 from app.schemas.types import EventType
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 
-# ========================================================================
-#  OpenRouter LLM 客户端 —— 零额外依赖，纯 requests 实现
-# ========================================================================
+# ════════════════════════════════════════════════════════════════════════
+#  OpenRouter LLM 客户端
+# ════════════════════════════════════════════════════════════════════════
 class _OpenRouterClient:
-    """
-    轻量 OpenRouter Chat Completions 客户端
-    兼容 OpenAI /v1/chat/completions 格式，支持 function calling
-    """
+    """零依赖 OpenRouter Chat Completions 客户端"""
 
     BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-    DEFAULT_MODEL = "openai/gpt-oss-120b:free"
+    DEFAULT_MODEL = "google/gemini-2.5-flash-preview:free"
 
     def __init__(self, api_key: str, model: str = ""):
         self.api_key = api_key
@@ -38,12 +38,8 @@ class _OpenRouterClient:
         messages: list,
         tools: list = None,
         temperature: float = 0.3,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
     ) -> dict:
-        """
-        发送 chat completion 请求
-        :return: OpenAI 格式的 response dict
-        """
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -59,62 +55,30 @@ class _OpenRouterClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-
-        resp = requests.post(
-            self.BASE_URL, headers=headers, json=payload, timeout=30
-        )
+        resp = requests.post(self.BASE_URL, headers=headers, json=payload, timeout=60)
         resp.raise_for_status()
         return resp.json()
 
-    def quick_ask(self, prompt: str, system: str = "") -> str:
-        """简单问答，返回纯文本"""
-        msgs = []
-        if system:
-            msgs.append({"role": "system", "content": system})
-        msgs.append({"role": "user", "content": prompt})
-        data = self.chat(msgs)
-        return (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
 
-
-# ========================================================================
-#  意图识别 & 工具定义
-# ========================================================================
-
-# Function calling 的 tools 定义
-_TOOLS = [
+# ════════════════════════════════════════════════════════════════════════
+#  Agent Tools 定义 — 返回结构化数据供 LLM 推理
+# ════════════════════════════════════════════════════════════════════════
+_AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_media",
-            "description": "搜索影视作品（电影、电视剧、动漫）。当用户想查找、搜索、看某部影视作品时调用。",
+            "description": (
+                "搜索影视作品（电影/电视剧/动漫），返回媒体信息列表。"
+                "当用户想查找、搜索、看某部影视作品时使用。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "keyword": {
                         "type": "string",
-                        "description": "影视作品名称关键词，如「流浪地球」「进击的巨人」",
-                    },
-                },
-                "required": ["keyword"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "subscribe_media",
-            "description": "订阅影视作品，系统会自动搜索并下载。当用户想订阅、追剧、自动下载某部作品时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "要订阅的影视作品名称",
-                    },
+                        "description": "影视作品名称，如「流浪地球」「进击的巨人」",
+                    }
                 },
                 "required": ["keyword"],
             },
@@ -124,40 +88,19 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "search_resources",
-            "description": "搜索指定影视作品的下载资源并按偏好筛选。当用户想要下载某部作品并可能指定了分辨率、声道、编码等偏好时调用。",
+            "description": (
+                "搜索指定影视作品的可下载种子资源，返回资源列表（含标题、站点、大小、"
+                "做种数、分辨率/编码/音轨/来源等标签）。"
+                "当用户想下载、想看资源列表、或指定了分辨率/声道/编码等偏好时使用。"
+                "你可以根据返回的标签信息为用户筛选和推荐最合适的资源。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "keyword": {
                         "type": "string",
                         "description": "影视作品名称",
-                    },
-                    "filters": {
-                        "type": "object",
-                        "description": "资源筛选条件",
-                        "properties": {
-                            "resolution": {
-                                "type": "string",
-                                "description": "分辨率偏好，如 4K/2160p/1080p/720p",
-                            },
-                            "audio": {
-                                "type": "string",
-                                "description": "音频偏好，如 5.1/7.1/Atmos/DTS/DTS-HD/TrueHD",
-                            },
-                            "codec": {
-                                "type": "string",
-                                "description": "视频编码偏好，如 x265/HEVC/x264/AV1/HDR/DV(Dolby Vision)",
-                            },
-                            "source": {
-                                "type": "string",
-                                "description": "来源偏好，如 BluRay/WEB-DL/Remux/HDTV",
-                            },
-                            "subtitle": {
-                                "type": "string",
-                                "description": "字幕偏好，如 中字/简中/繁中/双语",
-                            },
-                        },
-                    },
+                    }
                 },
                 "required": ["keyword"],
             },
@@ -166,80 +109,137 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "show_downloading",
-            "description": "查看当前正在下载的任务。当用户想知道下载进度、当前在下什么时调用。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "show_help",
-            "description": "显示帮助信息。当用户问怎么用、有什么功能时调用。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "chat_reply",
-            "description": "普通闲聊回复。当用户的消息不涉及影视搜索/订阅/下载，而是闲聊、问好、问问题时调用。",
+            "name": "download_resource",
+            "description": (
+                "下载指定序号的种子资源。必须先调用 search_resources 获取资源列表后才能使用。"
+                "在下载前应告知用户你选择了哪个资源及原因，并征得用户同意。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reply": {
+                    "index": {
+                        "type": "integer",
+                        "description": "资源在 search_resources 返回列表中的序号（从 0 开始）",
+                    }
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subscribe_media",
+            "description": (
+                "订阅影视作品，订阅后系统会自动搜索并下载更新。"
+                "可以传入 search_media 返回列表中的序号，或直接传入作品名称。"
+                "当用户想订阅、追剧、自动下载时使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "search_media 返回列表中的序号（从 0 开始），优先使用",
+                    },
+                    "keyword": {
                         "type": "string",
-                        "description": "回复给用户的内容",
+                        "description": "如果没有先搜索过，可直接传入作品名称",
                     },
                 },
-                "required": ["reply"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_downloading",
+            "description": "获取当前正在下载的任务列表，返回每个任务的名称和进度。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": (
+                "向用户发送一条中间状态消息（如搜索提示、处理中提示）。"
+                "适合在执行耗时操作前告知用户正在处理。"
+                "注意：Agent 最终回复会自动发送，不需要用这个工具发最终结果。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "要发送的消息内容",
+                    }
+                },
+                "required": ["text"],
             },
         },
     },
 ]
 
-_SYSTEM_PROMPT = """你是 MoviePilot 飞书机器人助手，帮助用户搜索、订阅和下载影视资源。
+_AGENT_SYSTEM_PROMPT = """你是 MoviePilot 飞书机器人 AI 助手。你可以通过工具帮助用户搜索、下载、订阅影视资源。
 
-你的能力：
-1. **搜索影视**：根据片名搜索电影/电视剧/动漫
-2. **订阅影视**：订阅后系统会自动搜索下载
-3. **搜索资源并筛选**：搜索下载资源，支持按分辨率(4K/1080p)、声道(5.1/7.1/Atmos)、编码(x265/HDR/DV)、来源(BluRay/Remux)、字幕等筛选
-4. **查看下载**：查看正在下载的任务
-5. **闲聊**：回答用户的一般性问题
+## 你的工具
+1. **search_media** — 搜索影视作品，获取媒体信息（标题、年份、类型、评分、简介）
+2. **search_resources** — 搜索下载资源，获取种子列表（标题、站点、大小、做种数、标签：分辨率/编码/音轨/来源）
+3. **download_resource** — 下载指定资源（需先 search_resources）
+4. **subscribe_media** — 订阅影视（自动追更下载）
+5. **get_downloading** — 查看当前下载进度
+6. **send_message** — 发送中间状态提示给用户
 
-规则：
-- 如果用户发了一个影视名称（不带任何其他说明），默认当作搜索处理
-- 如果用户说"找4K的XX"、"要5.1声道"、"下载XX的蓝光版"，使用 search_resources 并提取筛选条件
-- 如果用户说"订阅XX"、"追XX"、"自动下载XX"，使用 subscribe_media
-- 如果用户只是打招呼或问问题，用 chat_reply 回复
-- 筛选条件要从用户自然语言中智能提取，比如"杜比视界"→DV，"全景声"→Atmos
-- 对用户的消息保持简洁友好的回复风格"""
+## 工作规则
+
+### 搜索流程
+- 用户发来片名 → 调用 search_media → 向用户展示结果摘要
+- 用户如果只是想了解作品信息，展示搜索结果即可
+
+### 下载流程（核心能力）
+- 用户想下载（含指定偏好如 4K/5.1/蓝光等）→ 先 send_message 告知正在搜索 → 调用 search_resources 获取资源列表
+- 分析返回的 tags 字段，根据用户偏好智能筛选和排序
+- 向用户推荐最匹配的 1-3 个资源，说明推荐理由（分辨率、音轨、做种数等）
+- **重要：不要自行下载，展示推荐后等用户确认「下载第 X 个」**
+- 用户确认后调用 download_resource
+
+### 订阅流程
+- 用户想订阅/追剧 → 调用 search_media 确认作品 → 调用 subscribe_media
+
+### 偏好理解
+自然语言映射示例：
+- "4K" "超高清" → 2160p/4K/UHD
+- "蓝光" "原盘" → BluRay/Remux
+- "5.1环绕声" → 5.1/DD5.1/DDP5.1
+- "全景声" → Atmos
+- "杜比视界" "DV" → DolbyVision/DV
+- "HDR" → HDR/HDR10/HDR10+
+- "高码率" → Remux/BluRay + 大文件
+- "体积小" "小文件" → WEB-DL + x265 + 较小 size
+
+## 回复风格
+- 简洁友好，使用中文
+- 用 emoji 适当点缀，但不要过多
+- 展示列表时用编号，突出关键信息（分辨率、大小、做种数）
+- 如果用户只是打招呼或闲聊，直接友好回复，不需要调用工具"""
 
 
-# ========================================================================
+# ════════════════════════════════════════════════════════════════════════
 #  主插件类
-# ========================================================================
+# ════════════════════════════════════════════════════════════════════════
 class FeishuBot(_PluginBase):
-    # 插件名称
     plugin_name = "飞书机器人"
-    # 插件描述
-    plugin_desc = "飞书群机器人消息通知与交互，支持 AI 智能意图识别"
-    # 插件图标
+    plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
     plugin_icon = "Feishu_A.png"
-    # 插件版本
-    plugin_version = "2.4.0"
-    # 插件作者
+    plugin_version = "2.5.0"
     plugin_author = "Tsutomu-miku"
-    # 作者主页
     author_url = "https://github.com/Tsutomu-miku"
-    # 插件配置项ID前缀
     plugin_config_prefix = "feishubot_"
-    # 加载顺序
     plugin_order = 28
-    # 可使用的用户级别
     auth_level = 1
 
-    # ---- 配置属性 ----
+    # ── 配置属性 ──
     _enabled = False
     _app_id = ""
     _app_secret = ""
@@ -248,11 +248,20 @@ class FeishuBot(_PluginBase):
     _token = ""
     _token_expire = datetime.min
     _scheduler: Optional[BackgroundScheduler] = None
-
-    # ---- LLM 配置 ----
+    # ── LLM 配置 ──
     _llm_enabled = False
     _openrouter_key = ""
     _openrouter_model = ""
+
+    # ── 运行时状态 ──
+    _llm_client: Optional[_OpenRouterClient] = None
+    _search_cache: dict = {}       # user_id -> List[MediaInfo]
+    _resource_cache: dict = {}     # user_id -> List[Context]
+    _conversations: dict = {}      # user_id -> List[message]
+    _user_locks: dict = {}
+
+    _MAX_AGENT_ITERATIONS = 8
+    _MAX_CONVERSATION_MESSAGES = 30
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -261,20 +270,29 @@ class FeishuBot(_PluginBase):
             self._app_secret = config.get("app_secret", "")
             self._chat_id = config.get("chat_id", "")
             self._msgtypes = config.get("msgtypes") or []
-            # LLM 配置
             self._llm_enabled = config.get("llm_enabled", False)
             self._openrouter_key = config.get("openrouter_key", "")
             self._openrouter_model = config.get("openrouter_model", "")
-        self._search_cache: dict = {}
-        self._user_locks: dict = {}
-        self._llm_client: Optional[_OpenRouterClient] = None
+
+        self._search_cache = {}
+        self._resource_cache = {}
+        self._conversations = {}
+        self._user_locks = {}
+        self._llm_client = None
+
         if self._llm_enabled and self._openrouter_key:
             self._llm_client = _OpenRouterClient(
                 api_key=self._openrouter_key,
                 model=self._openrouter_model,
             )
+            logger.info(
+                f"飞书机器人 Agent 模式已启用，模型: "
+                f"{self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL}"
+            )
 
-    # region ========= 表单/页面 =========
+    # ════════════════════════════════════════════════════════════════
+    #  表单 / 页面
+    # ════════════════════════════════════════════════════════════════
     def get_state(self) -> bool:
         return self._enabled
 
@@ -293,40 +311,32 @@ class FeishuBot(_PluginBase):
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """
-        拼装插件配置页面
-        """
         MsgTypeOptions = [
             {"title": "入库", "value": "transfer"},
             {"title": "资源下载", "value": "download"},
             {"title": "订阅", "value": "subscribe"},
             {"title": "站点消息", "value": "site"},
-            {"title": "手动处理", "value": "manual"},
         ]
         return [
             {
                 "component": "VForm",
                 "content": [
-                    # ---- 基础配置行 ----
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {
-                                            "model": "enabled",
-                                            "label": "启用插件",
-                                        },
+                                        "props": {"model": "enabled", "label": "启用插件"},
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -340,7 +350,7 @@ class FeishuBot(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -352,45 +362,22 @@ class FeishuBot(_PluginBase):
                                     }
                                 ],
                             },
-                        ],
-                    },
-                    # ---- 群ID + 消息类型 ----
-                    {
-                        "component": "VRow",
-                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "chat_id",
-                                            "label": "群 Chat ID (可选)",
-                                            "placeholder": "不填则回复到消息来源",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "msgtypes",
-                                            "label": "消息类型",
-                                            "multiple": True,
-                                            "chips": True,
-                                            "items": MsgTypeOptions,
+                                            "label": "群 Chat ID",
+                                            "placeholder": "可选，不填则自动获取",
                                         },
                                     }
                                 ],
                             },
                         ],
                     },
-                    # ---- 分割线：AI 能力 ----
                     {
                         "component": "VRow",
                         "content": [
@@ -399,25 +386,43 @@ class FeishuBot(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
-                                        "component": "VDivider",
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "msgtypes",
+                                            "label": "通知消息类型",
+                                            "multiple": True,
+                                            "chips": True,
+                                            "items": MsgTypeOptions,
+                                        },
                                     }
                                 ],
                             }
                         ],
                     },
-                    # ---- AI / LLM 配置 ----
+                    # ── 分割线 ──
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12},
+                                "content": [{"component": "VDivider"}],
+                            }
+                        ],
+                    },
+                    # ── AI Agent 配置 ──
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "llm_enabled",
-                                            "label": "启用 AI 智能识别",
+                                            "label": "启用 AI Agent",
                                         },
                                     }
                                 ],
@@ -438,21 +443,21 @@ class FeishuBot(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 5},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "openrouter_model",
                                             "label": "模型 (可选)",
-                                            "placeholder": "默认: openai/gpt-oss-120b:free",
+                                            "placeholder": "默认: google/gemini-2.5-flash-preview:free",
                                         },
                                     }
                                 ],
                             },
                         ],
                     },
-                    # ---- 提示信息 ----
+                    # ── 说明 ──
                     {
                         "component": "VRow",
                         "content": [
@@ -465,10 +470,11 @@ class FeishuBot(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "基础用法：在飞书开放平台创建自建应用并配置事件回调地址: "
-                                            "http(s)://你的域名/api/v1/plugin/feishu_event\n"
-                                            "AI 增强：启用后支持自然语言交互，自动识别意图并筛选资源。"
-                                            "OpenRouter 提供免费模型，注册即可获取 API Key: https://openrouter.ai/settings/keys",
+                                            "text": (
+                                                "开启 AI Agent 后，机器人将化身智能体：自动理解自然语言、"
+                                                "按偏好筛选资源（4K/杜比/5.1 等）、多轮对话确认后下载。\n"
+                                                "API Key 获取: https://openrouter.ai/settings/keys（注册即送免费额度）"
+                                            ),
                                         },
                                     }
                                 ],
@@ -491,11 +497,10 @@ class FeishuBot(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
-    # endregion
-
-    # region ========= 飞书 Token / 发送 =========
+    # ════════════════════════════════════════════════════════════════
+    #  飞书 Token / 消息发送
+    # ════════════════════════════════════════════════════════════════
     def _get_token(self) -> str:
-        """获取 tenant_access_token（带缓存）"""
         if self._token and datetime.now() < self._token_expire:
             return self._token
         try:
@@ -510,7 +515,7 @@ class FeishuBot(_PluginBase):
                 seconds=data.get("expire", 7200) - 60
             )
         except Exception as e:
-            logger.error(f"获取飞书Token失败: {e}")
+            logger.error(f"获取飞书 Token 失败: {e}")
         return self._token
 
     def _headers(self):
@@ -520,7 +525,6 @@ class FeishuBot(_PluginBase):
         }
 
     def _send_text(self, chat_id: str, text: str, reply_id: str = None):
-        """发送文本消息"""
         body: dict = {
             "receive_id": chat_id,
             "msg_type": "text",
@@ -532,106 +536,58 @@ class FeishuBot(_PluginBase):
             resp = requests.post(
                 "https://open.feishu.cn/open-apis/im/v1/messages",
                 params={"receive_id_type": "chat_id"},
-                headers=self._headers(),
-                json=body,
-                timeout=10,
+                headers=self._headers(), json=body, timeout=10,
             )
             if resp.json().get("code") != 0:
-                logger.warning(f"飞书文本消息发送失败: {resp.text}")
+                logger.warning(f"飞书文本发送失败: {resp.text}")
         except Exception as e:
             logger.error(f"飞书发送文本异常: {e}")
 
-    def _send_card(self, chat_id: str, card: dict, reply_id: str = None):
-        """发送卡片消息"""
+    def _send_card(self, chat_id: str, card: dict):
         body: dict = {
             "receive_id": chat_id,
             "msg_type": "interactive",
             "content": _json.dumps(card, ensure_ascii=False),
         }
-        if reply_id:
-            body["reply_in_thread"] = True
         try:
             resp = requests.post(
                 "https://open.feishu.cn/open-apis/im/v1/messages",
                 params={"receive_id_type": "chat_id"},
-                headers=self._headers(),
-                json=body,
-                timeout=10,
+                headers=self._headers(), json=body, timeout=10,
             )
             if resp.json().get("code") != 0:
-                logger.warning(f"飞书卡片消息发送失败: {resp.text}")
+                logger.warning(f"飞书卡片发送失败: {resp.text}")
         except Exception as e:
             logger.error(f"飞书发送卡片异常: {e}")
 
-    def _send_image(self, chat_id: str, image_url: str):
-        """上传并发送图片（image_key 方式）"""
-        try:
-            img_resp = requests.get(image_url, timeout=15)
-            if img_resp.status_code != 200:
-                return
-            upload = requests.post(
-                "https://open.feishu.cn/open-apis/im/v1/images",
-                headers={"Authorization": f"Bearer {self._get_token()}"},
-                data={"image_type": "message"},
-                files={"image": ("poster.jpg", img_resp.content, "image/jpeg")},
-                timeout=15,
-            )
-            image_key = upload.json().get("data", {}).get("image_key")
-            if not image_key:
-                return
-            body = {
-                "receive_id": chat_id,
-                "msg_type": "image",
-                "content": _json.dumps({"image_key": image_key}),
-            }
-            requests.post(
-                "https://open.feishu.cn/open-apis/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
-                headers=self._headers(),
-                json=body,
-                timeout=10,
-            )
-        except Exception as e:
-            logger.error(f"飞书发送图片异常: {e}")
-
-    # endregion
-
-    # region ========= 事件回调入口 =========
+    # ════════════════════════════════════════════════════════════════
+    #  事件回调入口
+    # ════════════════════════════════════════════════════════════════
     def _feishu_event(self, request_data: dict = None, **kwargs) -> dict:
-        """
-        飞书事件回调统一入口
-        """
         data = request_data or {}
-
-        # ---- 1. URL 验证挑战 ----
+        # URL 验证
         if data.get("type") == "url_verification":
             return {"challenge": data.get("challenge", "")}
-
-        # ---- 2. 卡片回调 (card.action.trigger) ----
+        # 卡片回调
         if data.get("type") == "card.action.trigger":
             return self._handle_card_action(data)
 
         header = data.get("header", {})
         event = data.get("event", {})
-        event_type = header.get("event_type", "")
-
-        # ---- 3. 普通消息 ----
-        if event_type == "im.message.receive_v1":
+        if header.get("event_type") == "im.message.receive_v1":
             threading.Thread(
                 target=self._handle_message, args=(event,), daemon=True
             ).start()
         return {"code": 0}
 
-    # endregion
-
-    # region ========= 消息处理 — 含 LLM 意图识别 =========
+    # ════════════════════════════════════════════════════════════════
+    #  消息路由
+    # ════════════════════════════════════════════════════════════════
     def _handle_message(self, event: dict):
-        """处理 im.message.receive_v1 事件"""
         msg = event.get("message", {})
         chat_id = msg.get("chat_id", "") or self._chat_id
         msg_id = msg.get("message_id", "")
         msg_type = msg.get("message_type", "")
-
         sender = event.get("sender", {}).get("sender_id", {})
         user_id = sender.get("open_id", "")
 
@@ -648,660 +604,484 @@ class FeishuBot(_PluginBase):
 
         logger.info(f"飞书收到: user={user_id}, text={text}")
 
-        # ---- 优先检查显式指令（始终生效，不依赖 LLM）----
-        if text.startswith("/search") or text.startswith("/搜索"):
-            keyword = re.sub(r"^/(search|搜索)\s*", "", text).strip()
-            self._cmd_search(keyword, chat_id, msg_id, user_id)
-            return
-        if text.startswith("/subscribe") or text.startswith("/订阅"):
-            keyword = re.sub(r"^/(subscribe|订阅)\s*", "", text).strip()
-            self._cmd_subscribe(keyword, chat_id, msg_id, user_id)
-            return
-        if text.startswith("/downloading") or text.startswith("/正在下载"):
-            self._cmd_downloading(chat_id, msg_id)
-            return
-        if text.startswith("/help") or text.startswith("/帮助"):
-            self._cmd_help(chat_id, msg_id)
+        # ── Agent 模式：一切交给 LLM ──
+        if self._llm_client:
+            self._agent_handle(text, chat_id, msg_id, user_id)
             return
 
-        # ---- LLM 意图识别模式 ----
-        if self._llm_client:
-            self._handle_with_llm(text, chat_id, msg_id, user_id)
+        # ── 传统模式：指令解析 ──
+        if text.startswith("/帮助") or text.startswith("/help"):
+            self._cmd_help(chat_id, msg_id)
+        elif text.startswith("/搜索") or text.startswith("/search"):
+            kw = re.sub(r"^/(搜索|search)\s*", "", text).strip()
+            self._cmd_search(kw, chat_id, msg_id, user_id)
+        elif text.startswith("/订阅") or text.startswith("/subscribe"):
+            kw = re.sub(r"^/(订阅|subscribe)\s*", "", text).strip()
+            self._cmd_subscribe(kw, chat_id, msg_id, user_id)
+        elif text.startswith("/正在下载") or text.startswith("/downloading"):
+            self._cmd_downloading(chat_id, msg_id)
         else:
-            # 无 LLM：回退到默认搜索
+            # 默认当作搜索
             self._cmd_search(text, chat_id, msg_id, user_id)
 
-    def _handle_with_llm(self, text: str, chat_id: str, msg_id: str, user_id: str):
-        """使用 LLM function calling 识别意图并路由"""
+    # ════════════════════════════════════════════════════════════════
+    #  Agent 核心 — 多轮 Tool Calling 循环
+    # ════════════════════════════════════════════════════════════════
+    def _agent_handle(self, text: str, chat_id: str, msg_id: str, user_id: str):
+        """Agent 入口：构建对话上下文，执行 agent loop"""
+        lock = self._get_user_lock(user_id)
+        if not lock.acquire(blocking=False):
+            self._send_text(chat_id, "⏳ 上一个请求还在处理中，请稍候...")
+            return
         try:
-            messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ]
-            result = self._llm_client.chat(messages=messages, tools=_TOOLS)
+            # 构建对话历史
+            history = self._get_conversation(user_id)
+            history.append({"role": "user", "content": text})
+
+            # 执行 agent loop
+            final_reply = self._agent_loop(history, chat_id, user_id)
+
+            # 发送最终回复
+            if final_reply:
+                self._send_text(chat_id, final_reply, msg_id)
+
+            # 保存对话历史
+            self._save_conversation(user_id, history)
+
+        except Exception as e:
+            logger.error(f"Agent 异常: {e}", exc_info=True)
+            self._send_text(chat_id, f"⚠️ AI 处理出错: {e}", msg_id)
+        finally:
+            lock.release()
+
+    def _agent_loop(
+        self, messages: list, chat_id: str, user_id: str
+    ) -> str:
+        """
+        Agent 循环：
+        1. 发送 messages + tools 给 LLM
+        2. 如果 LLM 返回 tool_calls → 执行工具 → 结果反馈 → 回到 1
+        3. 如果 LLM 返回纯文本 → 结束循环，返回文本
+        """
+        for iteration in range(self._MAX_AGENT_ITERATIONS):
+            try:
+                result = self._llm_client.chat(
+                    messages=messages, tools=_AGENT_TOOLS
+                )
+            except Exception as e:
+                logger.error(f"Agent LLM 调用失败 (第{iteration+1}轮): {e}")
+                return f"⚠️ AI 调用失败: {e}"
 
             choice = result.get("choices", [{}])[0]
             message = choice.get("message", {})
 
             # 检查是否有 tool_calls
             tool_calls = message.get("tool_calls")
-            if tool_calls:
-                tc = tool_calls[0]  # 取第一个工具调用
+
+            if not tool_calls:
+                # LLM 返回了最终文本回复
+                reply = message.get("content", "")
+                # 把 assistant 回复加入历史
+                messages.append({"role": "assistant", "content": reply})
+                return reply
+
+            # 有 tool_calls → 执行工具
+            # 先把 assistant 消息（含 tool_calls）加入历史
+            messages.append(message)
+
+            for tc in tool_calls:
                 fn_name = tc.get("function", {}).get("name", "")
-                fn_args_str = tc.get("function", {}).get("arguments", "{}")
+                fn_args_raw = tc.get("function", {}).get("arguments", "{}")
+                tc_id = tc.get("id", "")
+
                 try:
-                    fn_args = _json.loads(fn_args_str)
+                    fn_args = _json.loads(fn_args_raw)
                 except Exception:
                     fn_args = {}
 
-                logger.info(f"LLM 意图: {fn_name}, args={fn_args}")
-                self._dispatch_tool(fn_name, fn_args, chat_id, msg_id, user_id)
-            else:
-                # LLM 没有调用工具，直接返回文本回复
-                reply = message.get("content", "")
-                if reply:
-                    self._send_text(chat_id, reply, msg_id)
-                else:
-                    # 回退到搜索
-                    self._cmd_search(text, chat_id, msg_id, user_id)
+                logger.info(
+                    f"Agent tool call [{iteration+1}]: {fn_name}({fn_args})"
+                )
 
-        except Exception as e:
-            logger.warning(f"LLM 意图识别异常，回退到关键词搜索: {e}")
-            # LLM 失败时回退到默认搜索
-            self._cmd_search(text, chat_id, msg_id, user_id)
+                # 执行工具
+                tool_result = self._execute_tool(
+                    fn_name, fn_args, chat_id, user_id
+                )
 
-    def _dispatch_tool(
-        self, fn_name: str, fn_args: dict,
-        chat_id: str, msg_id: str, user_id: str,
-    ):
-        """根据 LLM 返回的 function name 路由到对应处理方法"""
-        if fn_name == "search_media":
-            self._cmd_search(fn_args.get("keyword", ""), chat_id, msg_id, user_id)
-        elif fn_name == "subscribe_media":
-            self._cmd_subscribe(fn_args.get("keyword", ""), chat_id, msg_id, user_id)
-        elif fn_name == "search_resources":
-            keyword = fn_args.get("keyword", "")
-            filters = fn_args.get("filters", {})
-            self._cmd_search_resources(keyword, filters, chat_id, msg_id, user_id)
-        elif fn_name == "show_downloading":
-            self._cmd_downloading(chat_id, msg_id)
-        elif fn_name == "show_help":
-            self._cmd_help(chat_id, msg_id)
-        elif fn_name == "chat_reply":
-            reply = fn_args.get("reply", "🤔 我不太理解你的意思")
-            self._send_text(chat_id, reply, msg_id)
-        else:
-            logger.warning(f"未知的 LLM 工具调用: {fn_name}")
-            self._cmd_search(fn_args.get("keyword", ""), chat_id, msg_id, user_id)
+                # 把工具结果加入历史
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": _json.dumps(
+                            tool_result, ensure_ascii=False, default=str
+                        ),
+                    }
+                )
 
-    # endregion
+        # 超过最大轮次
+        return "⚠️ 处理步骤过多，请尝试简化请求。"
 
-    # region ========= 指令实现 =========
-
-    def _get_user_lock(self, user_id: str):
-        """获取用户级别的锁，防止同一用户并发操作冲突"""
-        if user_id not in self._user_locks:
-            self._user_locks[user_id] = threading.Lock()
-        return self._user_locks[user_id]
-
-    def _cmd_search(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
-        """
-        搜索影视
-        使用 MediaChain().search(title) -> (MetaBase, List[MediaInfo])
-        """
-        if not keyword:
-            return
-        lock = self._get_user_lock(user_id)
-        if not lock.acquire(blocking=False):
-            self._send_text(chat_id, "⏳ 上一个请求还在处理中，请稍候...", msg_id)
-            return
+    # ════════════════════════════════════════════════════════════════
+    #  工具调度器
+    # ════════════════════════════════════════════════════════════════
+    def _execute_tool(
+        self, fn_name: str, fn_args: dict, chat_id: str, user_id: str
+    ) -> dict:
+        """路由到具体的工具实现"""
         try:
-            self._send_text(chat_id, f"🔍 正在搜索: {keyword} ...", msg_id)
+            if fn_name == "search_media":
+                return self._tool_search_media(
+                    fn_args.get("keyword", ""), user_id
+                )
+            elif fn_name == "search_resources":
+                return self._tool_search_resources(
+                    fn_args.get("keyword", ""), user_id
+                )
+            elif fn_name == "download_resource":
+                return self._tool_download_resource(
+                    fn_args.get("index", 0), user_id, chat_id
+                )
+            elif fn_name == "subscribe_media":
+                return self._tool_subscribe_media(
+                    fn_args.get("index"), fn_args.get("keyword"), user_id
+                )
+            elif fn_name == "get_downloading":
+                return self._tool_get_downloading()
+            elif fn_name == "send_message":
+                text = fn_args.get("text", "")
+                if text:
+                    self._send_text(chat_id, text)
+                return {"sent": True}
+            else:
+                return {"error": f"未知工具: {fn_name}"}
+        except Exception as e:
+            logger.error(f"工具 {fn_name} 执行异常: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    # ════════════════════════════════════════════════════════════════
+    #  Agent 工具实现 — 返回结构化数据供 LLM 推理
+    # ════════════════════════════════════════════════════════════════
+    def _tool_search_media(self, keyword: str, user_id: str) -> dict:
+        """搜索影视作品，返回媒体列表"""
+        if not keyword:
+            return {"error": "请提供搜索关键词"}
+        try:
             from app.chain.media import MediaChain
 
             mc = MediaChain()
             result = mc.search(title=keyword)
 
             if not isinstance(result, tuple) or len(result) != 2:
-                logger.warning(f"search() 返回了非预期类型: {type(result)}")
-                self._send_text(chat_id, "⚠️ 搜索返回异常，请重试")
-                return
+                return {"error": "搜索返回格式异常", "results": []}
 
             meta, medias = result
 
-            if not meta or not getattr(meta, "name", None):
-                self._send_text(chat_id, f"😔 无法识别: {keyword}")
-                return
             if not medias:
-                self._send_text(
-                    chat_id,
-                    f"😔 未找到 {getattr(meta, 'name', keyword)} 的相关结果",
-                )
-                return
+                name = getattr(meta, "name", keyword) if meta else keyword
+                return {"keyword": keyword, "results": [], "message": f"未找到「{name}」的相关结果"}
 
-            valid_medias = [
-                m for m in medias[:6]
-                if hasattr(m, "title") and hasattr(m, "type")
-            ]
-            if not valid_medias:
-                self._send_text(
-                    chat_id,
-                    f"😔 未找到 {getattr(meta, 'name', keyword)} 的有效结果",
-                )
-                return
+            # 过滤有效结果并序列化
+            valid = []
+            for i, m in enumerate(medias[:8]):
+                if not hasattr(m, "title"):
+                    continue
+                raw_type = getattr(m, "type", None)
+                if hasattr(raw_type, "value"):
+                    mtype_str = "电影" if raw_type == MediaType.MOVIE else "电视剧"
+                else:
+                    mtype_str = str(raw_type) if raw_type else "未知"
 
-            self._search_cache[user_id] = valid_medias
-            self._send_card(chat_id, self._build_search_card(valid_medias, keyword))
+                valid.append(
+                    {
+                        "index": i,
+                        "title": getattr(m, "title", ""),
+                        "year": getattr(m, "year", ""),
+                        "type": mtype_str,
+                        "rating": getattr(m, "vote_average", ""),
+                        "overview": (getattr(m, "overview", "") or "")[:120],
+                        "tmdb_id": getattr(m, "tmdb_id", ""),
+                    }
+                )
+
+            # 缓存
+            self._search_cache[user_id] = medias[:8]
+
+            return {
+                "keyword": keyword,
+                "total_found": len(medias),
+                "results": valid,
+            }
         except Exception as e:
-            logger.error(f"飞书搜索异常: {e}", exc_info=True)
-            self._send_text(chat_id, f"⚠️ 搜索出错: {e}")
-        finally:
-            lock.release()
+            logger.error(f"tool search_media 异常: {e}", exc_info=True)
+            return {"error": str(e)}
 
-    def _cmd_subscribe(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
-        """
-        订阅影视
-        优先 search() 识别，后备 recognize_by_meta()
-        """
+    def _tool_search_resources(self, keyword: str, user_id: str) -> dict:
+        """搜索种子资源，返回资源列表（含标签）"""
         if not keyword:
-            return
-        lock = self._get_user_lock(user_id)
-        if not lock.acquire(blocking=False):
-            self._send_text(chat_id, "⏳ 上一个请求还在处理中，请稍候...", msg_id)
-            return
+            return {"error": "请提供搜索关键词"}
         try:
-            self._send_text(chat_id, f"📥 正在订阅: {keyword} ...", msg_id)
             from app.chain.media import MediaChain
+            from app.chain.search import SearchChain
 
-            mc = MediaChain()
-            mediainfo = None
-
+            # 先识别精确标题
+            title = keyword
             try:
+                mc = MediaChain()
                 result = mc.search(title=keyword)
                 if isinstance(result, tuple) and len(result) == 2:
                     meta, medias = result
+                    if medias and hasattr(medias[0], "title"):
+                        title = medias[0].title or keyword
+            except Exception:
+                pass
+
+            # 搜索种子
+            contexts = SearchChain().search_by_title(title=title)
+            if not contexts:
+                return {
+                    "keyword": keyword,
+                    "title": title,
+                    "results": [],
+                    "message": f"未找到「{title}」的下载资源",
+                }
+
+            # 序列化并提取标签
+            results = []
+            for i, ctx in enumerate(contexts[:20]):
+                t = getattr(ctx, "torrent_info", None)
+                if not t:
+                    continue
+                tname = getattr(t, "title", "") or getattr(t, "description", "") or ""
+                tags = self._extract_tags(tname)
+                results.append(
+                    {
+                        "index": i,
+                        "title": tname,
+                        "site": getattr(t, "site_name", ""),
+                        "size": getattr(t, "size", ""),
+                        "seeders": getattr(t, "seeders", ""),
+                        "tags": tags,
+                    }
+                )
+
+            # 缓存
+            self._resource_cache[user_id] = contexts[:20]
+
+            return {
+                "keyword": keyword,
+                "title": title,
+                "total_found": len(contexts),
+                "showing": len(results),
+                "results": results,
+            }
+        except Exception as e:
+            logger.error(f"tool search_resources 异常: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    def _tool_download_resource(
+        self, index: int, user_id: str, chat_id: str
+    ) -> dict:
+        """下载指定序号的资源"""
+        cached = self._resource_cache.get(user_id, [])
+        if not cached:
+            return {"error": "没有缓存的资源列表，请先调用 search_resources"}
+        if index < 0 or index >= len(cached):
+            return {"error": f"序号 {index} 无效，有效范围: 0-{len(cached)-1}"}
+
+        try:
+            from app.chain.download import DownloadChain
+
+            ctx = cached[index]
+            t = getattr(ctx, "torrent_info", None)
+            title = getattr(t, "title", "未知") if t else "未知"
+
+            dc = DownloadChain()
+            result = dc.download_single(context=ctx, userid="feishu")
+            if result:
+                return {"success": True, "title": title, "message": f"已添加下载: {title}"}
+            else:
+                return {"success": False, "title": title, "message": "下载提交失败"}
+        except Exception as e:
+            logger.error(f"tool download_resource 异常: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    def _tool_subscribe_media(
+        self, index: Optional[int], keyword: Optional[str], user_id: str
+    ) -> dict:
+        """订阅影视作品"""
+        mediainfo = None
+
+        # 优先从缓存取
+        if index is not None:
+            cached = self._search_cache.get(user_id, [])
+            if 0 <= index < len(cached):
+                mediainfo = cached[index]
+
+        # 无缓存 → 用关键词搜索
+        if not mediainfo and keyword:
+            try:
+                from app.chain.media import MediaChain
+
+                mc = MediaChain()
+                result = mc.search(title=keyword)
+                if isinstance(result, tuple) and len(result) == 2:
+                    _, medias = result
                     if medias:
                         for m in medias:
                             if hasattr(m, "title") and hasattr(m, "type"):
                                 mediainfo = m
                                 break
             except Exception as e:
-                logger.warning(f"订阅搜索阶段异常: {e}")
+                return {"error": f"搜索失败: {e}"}
 
-            if not mediainfo:
-                try:
-                    from app.core.metainfo import MetaInfo as MetaInfoFunc
+        if not mediainfo:
+            return {"error": "未找到可订阅的作品，请提供更精确的名称"}
 
-                    metainfo = MetaInfoFunc(title=keyword)
-                    mediainfo = mc.recognize_by_meta(metainfo)
-                    if mediainfo and not hasattr(mediainfo, "type"):
-                        logger.warning(
-                            f"recognize_by_meta 返回了非 MediaInfo 对象: {type(mediainfo)}"
-                        )
-                        mediainfo = None
-                except Exception as e:
-                    logger.warning(f"订阅识别阶段异常: {e}")
-
-            if not mediainfo:
-                self._send_text(chat_id, f"❌ 未识别到: {keyword}")
-                return
-
-            self._subscribe_media(mediainfo, chat_id, msg_id)
-        except Exception as e:
-            logger.error(f"飞书订阅异常: {e}", exc_info=True)
-            self._send_text(chat_id, f"⚠️ 订阅出错: {e}")
-        finally:
-            lock.release()
-
-    def _cmd_search_resources(
-        self, keyword: str, filters: dict,
-        chat_id: str, msg_id: str, user_id: str,
-    ):
-        """
-        搜索下载资源并按偏好筛选
-        LLM 提取的 filters: resolution, audio, codec, source, subtitle
-        """
-        if not keyword:
-            return
-        lock = self._get_user_lock(user_id)
-        if not lock.acquire(blocking=False):
-            self._send_text(chat_id, "⏳ 上一个请求还在处理中，请稍候...", msg_id)
-            return
         try:
-            # 构造筛选条件描述
-            filter_desc = self._format_filters(filters)
-            hint = f"🔍 正在搜索 {keyword} 的资源"
-            if filter_desc:
-                hint += f"（{filter_desc}）"
-            hint += " ..."
-            self._send_text(chat_id, hint, msg_id)
+            from app.chain.subscribe import SubscribeChain
 
-            # 先搜索媒体获取标题
-            from app.chain.media import MediaChain
-            from app.chain.search import SearchChain
+            title = getattr(mediainfo, "title", "") or "未知"
+            raw_type = getattr(mediainfo, "type", None)
+            mtype = raw_type if (raw_type and hasattr(raw_type, "value")) else MediaType.MOVIE
 
-            mc = MediaChain()
-            title = keyword
-            try:
-                result = mc.search(title=keyword)
-                if isinstance(result, tuple) and len(result) == 2:
-                    meta, medias = result
-                    if medias and hasattr(medias[0], "title"):
-                        title = medias[0].title or keyword
-                        self._search_cache[user_id] = [
-                            m for m in medias[:6]
-                            if hasattr(m, "title") and hasattr(m, "type")
-                        ]
-            except Exception as e:
-                logger.warning(f"资源搜索-媒体识别异常: {e}")
-
-            # 搜索种子资源
-            contexts = SearchChain().search_by_title(title=title)
-            if not contexts:
-                self._send_text(chat_id, f"😔 未找到 {title} 的下载资源")
-                return
-
-            # 应用筛选
-            filtered = self._apply_filters(contexts, filters)
-            if not filtered and filters:
-                # 筛选后无结果，提示并展示全部
-                self._send_text(
-                    chat_id,
-                    f"⚠️ 未找到完全匹配筛选条件的资源，为你展示所有结果：",
-                )
-                filtered = contexts
-
-            # 缓存并展示
-            show_list = filtered[:10]
-            self._search_cache[f"{user_id}_res"] = show_list
-            card = self._build_resource_card(title, show_list, filters)
-            self._send_card(chat_id, card)
-        except Exception as e:
-            logger.error(f"飞书资源搜索异常: {e}", exc_info=True)
-            self._send_text(chat_id, f"⚠️ 搜索资源出错: {e}")
-        finally:
-            lock.release()
-
-    def _cmd_downloading(self, chat_id: str, msg_id: str):
-        """正在下载"""
-        from app.chain.download import DownloadChain
-
-        dc = DownloadChain()
-        torrents = dc.downloading_torrents()
-        if not torrents:
-            self._send_text(chat_id, "当前没有正在下载的任务")
-            return
-        lines = []
-        for i, t in enumerate(torrents[:10], 1):
-            name = getattr(t, "title", "") or getattr(t, "name", "未知")
-            progress = getattr(t, "progress", 0)
-            lines.append(f"{i}. {name}  进度: {progress}%")
-        self._send_text(chat_id, "\n".join(lines), msg_id)
-
-    def _cmd_help(self, chat_id: str, msg_id: str):
-        ai_status = "✅ 已启用" if self._llm_client else "❌ 未启用"
-        model_name = self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL
-        help_text = (
-            "📖 飞书机器人指令帮助\n\n"
-            "**基础指令：**\n"
-            "/搜索 <片名>  —— 搜索影视\n"
-            "/订阅 <片名>  —— 直接订阅\n"
-            "/正在下载      —— 查看下载进度\n"
-            "/帮助          —— 显示本帮助\n\n"
-            "**AI 智能模式：**\n"
-            f"状态: {ai_status}\n"
-            f"模型: {model_name}\n\n"
-            "开启 AI 后可直接用自然语言交互：\n"
-            '• "找一部4K的流浪地球"\n'
-            '• "下载5.1声道蓝光版的星际穿越"\n'
-            '• "订阅进击的巨人最终季"\n'
-            '• "有杜比视界的奥本海默吗"\n\n'
-            "直接发送片名也会触发搜索"
-        )
-        self._send_text(chat_id, help_text, msg_id)
-
-    # endregion
-
-    # region ========= 资源筛选逻辑 =========
-
-    # 筛选关键词映射 — 用于匹配 torrent title
-    _RESOLUTION_KEYWORDS = {
-        "4k": ["4k", "2160p", "uhd"],
-        "2160p": ["4k", "2160p", "uhd"],
-        "1080p": ["1080p", "1080i"],
-        "720p": ["720p"],
-    }
-    _AUDIO_KEYWORDS = {
-        "5.1": ["5.1", "dd5.1", "ddp5.1", "dd+5.1", "ac3.5.1"],
-        "7.1": ["7.1", "ddp7.1", "dd+7.1"],
-        "atmos": ["atmos"],
-        "dts": ["dts"],
-        "dts-hd": ["dts-hd", "dts-hdma", "dts-hd.ma"],
-        "truehd": ["truehd", "true-hd"],
-    }
-    _CODEC_KEYWORDS = {
-        "x265": ["x265", "hevc", "h265", "h.265"],
-        "hevc": ["x265", "hevc", "h265", "h.265"],
-        "x264": ["x264", "h264", "h.264", "avc"],
-        "av1": ["av1"],
-        "hdr": ["hdr", "hdr10", "hdr10+"],
-        "dv": ["dv", "dolby.vision", "dolbyvision", "dovi"],
-    }
-    _SOURCE_KEYWORDS = {
-        "bluray": ["bluray", "blu-ray", "bdremux", "bdrip"],
-        "remux": ["remux"],
-        "web-dl": ["web-dl", "webdl"],
-        "webrip": ["webrip", "web-rip"],
-        "hdtv": ["hdtv"],
-    }
-
-    def _apply_filters(self, contexts: list, filters: dict) -> list:
-        """
-        对搜索到的 Context 列表按照筛选条件进行过滤
-        匹配策略：宽松匹配（OR），只要 torrent title 中包含任一关键词即算匹配
-        """
-        if not filters:
-            return contexts
-
-        def _match(text: str, category: dict, value: str) -> bool:
-            """检查 text 中是否包含 value 对应的关键词"""
-            if not value:
-                return True  # 无此筛选条件
-            value_lower = value.lower().replace(" ", "").replace("-", "")
-            # 从映射中查找关键词列表
-            keywords = category.get(value_lower)
-            if not keywords:
-                # 未在映射中找到，尝试直接匹配原始值
-                keywords = [value_lower]
-            text_lower = text.lower().replace(" ", "")
-            return any(kw in text_lower for kw in keywords)
-
-        result = []
-        for ctx in contexts:
-            t = getattr(ctx, "torrent_info", None)
-            if not t:
-                continue
-            torrent_title = (
-                getattr(t, "title", "") or getattr(t, "description", "") or ""
+            sid, err_msg = SubscribeChain().add(
+                mtype=mtype,
+                title=title,
+                year=getattr(mediainfo, "year", ""),
+                tmdbid=getattr(mediainfo, "tmdb_id", None),
+                doubanid=getattr(mediainfo, "douban_id", None),
+                exist_ok=True,
+                username="飞书用户",
             )
-            if not torrent_title:
-                continue
-
-            match = True
-            if filters.get("resolution"):
-                match = match and _match(
-                    torrent_title, self._RESOLUTION_KEYWORDS, filters["resolution"]
-                )
-            if filters.get("audio"):
-                match = match and _match(
-                    torrent_title, self._AUDIO_KEYWORDS, filters["audio"]
-                )
-            if filters.get("codec"):
-                match = match and _match(
-                    torrent_title, self._CODEC_KEYWORDS, filters["codec"]
-                )
-            if filters.get("source"):
-                match = match and _match(
-                    torrent_title, self._SOURCE_KEYWORDS, filters["source"]
-                )
-            if filters.get("subtitle"):
-                sub_kw = filters["subtitle"].lower()
-                match = match and (sub_kw in torrent_title.lower())
-
-            if match:
-                result.append(ctx)
-        return result
-
-    @staticmethod
-    def _format_filters(filters: dict) -> str:
-        """将筛选条件格式化为可读字符串"""
-        if not filters:
-            return ""
-        parts = []
-        label_map = {
-            "resolution": "分辨率",
-            "audio": "声道",
-            "codec": "编码",
-            "source": "来源",
-            "subtitle": "字幕",
-        }
-        for key, label in label_map.items():
-            val = filters.get(key)
-            if val:
-                parts.append(f"{label}: {val}")
-        return " / ".join(parts)
-
-    # endregion
-
-    # region ========= 卡片构造 =========
-
-    def _build_search_card(self, medias: list, keyword: str) -> dict:
-        """构造搜索结果卡片"""
-        elements = [
-            {
-                "tag": "markdown",
-                "content": f"**🔍 \u201c{keyword}\u201d 的搜索结果 (前{len(medias)}条)**",
-            },
-            {"tag": "hr"},
-        ]
-        for idx, media in enumerate(medias):
-            title = getattr(media, "title", "") or getattr(
-                media, "title_year", "未知"
-            )
-            year = getattr(media, "year", "")
-            raw_type = getattr(media, "type", None)
-            if hasattr(raw_type, "value"):
-                mtype = "电影" if raw_type == MediaType.MOVIE else "电视剧"
+            if sid:
+                return {"success": True, "title": title, "message": f"已订阅: {title}"}
             else:
-                mtype = (
-                    "电影"
-                    if str(raw_type).lower() in ("movie", "电影")
-                    else "电视剧"
-                )
-            vote = getattr(media, "vote_average", "")
-            overview = (getattr(media, "overview", "") or "")[:80]
-            poster = getattr(media, "poster_url", "") or ""
+                return {"success": False, "title": title, "message": err_msg or "订阅失败"}
+        except Exception as e:
+            logger.error(f"tool subscribe_media 异常: {e}", exc_info=True)
+            return {"error": str(e)}
 
-            md_lines = [f"**{idx + 1}. {title}**"]
-            if year:
-                md_lines.append(f"年份: {year}")
-            md_lines.append(f"类型: {mtype}")
-            if vote:
-                md_lines.append(f"评分: {vote}")
-            if overview:
-                md_lines.append(f"简介: {overview}...")
+    def _tool_get_downloading(self) -> dict:
+        """获取当前下载列表"""
+        try:
+            from app.chain.download import DownloadChain
 
-            col_text = {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 3,
-                "vertical_align": "top",
-                "elements": [
-                    {"tag": "markdown", "content": "\n".join(md_lines)}
-                ],
-            }
-            col_img = {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "vertical_align": "top",
-                "elements": [],
-            }
-            if poster:
-                col_img["elements"].append(
+            torrents = DownloadChain().downloading_torrents()
+            if not torrents:
+                return {"tasks": [], "message": "当前没有正在下载的任务"}
+
+            tasks = []
+            for t in torrents[:15]:
+                tasks.append(
                     {
-                        "tag": "img",
-                        "img_key": poster,
-                        "alt": {"tag": "plain_text", "content": title},
-                        "preview": True,
+                        "title": getattr(t, "title", "") or getattr(t, "name", "未知"),
+                        "progress": getattr(t, "progress", 0),
                     }
                 )
+            return {"tasks": tasks, "total": len(torrents)}
+        except Exception as e:
+            return {"error": str(e)}
 
-            elements.append(
-                {
-                    "tag": "column_set",
-                    "flex_mode": "none",
-                    "background_style": "default",
-                    "columns": [col_text, col_img],
-                }
-            )
-            elements.append(
-                {
-                    "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {
-                                "tag": "plain_text",
-                                "content": f"📥 订阅 {title}",
-                            },
-                            "type": "primary",
-                            "value": {
-                                "action": "subscribe",
-                                "index": str(idx),
-                            },
-                        },
-                        {
-                            "tag": "button",
-                            "text": {
-                                "tag": "plain_text",
-                                "content": f"📦 搜索资源",
-                            },
-                            "type": "default",
-                            "value": {
-                                "action": "search_resource",
-                                "index": str(idx),
-                            },
-                        },
-                    ],
-                }
-            )
-            elements.append({"tag": "hr"})
-
-        return {
-            "config": {"wide_screen_mode": True},
-            "elements": elements,
-            "header": {
-                "title": {"tag": "plain_text", "content": "搜索结果"},
-                "template": "blue",
-            },
-        }
-
-    def _build_resource_card(
-        self, title: str, contexts: list, filters: dict = None
-    ) -> dict:
-        """构造资源列表卡片"""
-        filter_desc = self._format_filters(filters) if filters else ""
-        header_text = f"📦 {title} 的资源"
-        if filter_desc:
-            header_text += f"（{filter_desc}）"
-
-        elements = []
-        for i, ctx in enumerate(contexts):
-            t = getattr(ctx, "torrent_info", None)
-            if not t:
-                continue
-            tname = getattr(t, "title", "") or "未知"
-            line = f"**{i + 1}. {tname}**\n"
-            parts = []
-            if getattr(t, "site_name", ""):
-                parts.append(f"站点: {t.site_name}")
-            if getattr(t, "size", ""):
-                parts.append(f"大小: {t.size}")
-            if getattr(t, "seeders", ""):
-                parts.append(f"做种: {t.seeders}")
-            if parts:
-                line += " | ".join(parts)
-
-            # 高亮匹配到的筛选关键词
-            if filters:
-                tags = self._extract_resource_tags(tname)
-                if tags:
-                    line += f"\n🏷️ {' '.join(tags)}"
-
-            elements.append(
-                {"tag": "div", "text": {"tag": "lark_md", "content": line}}
-            )
-            elements.append(
-                {
-                    "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {
-                                "tag": "plain_text",
-                                "content": f"⬇️ 下载",
-                            },
-                            "type": "primary",
-                            "value": {
-                                "action": "download_resource",
-                                "index": str(i),
-                            },
-                        }
-                    ],
-                }
-            )
-            elements.append({"tag": "hr"})
-
-        elements.append(
-            {
-                "tag": "note",
-                "elements": [
-                    {
-                        "tag": "plain_text",
-                        "content": "💡 点击「下载」按钮开始下载对应资源",
-                    }
-                ],
-            }
-        )
-
-        return {
-            "config": {"wide_screen_mode": True},
-            "elements": elements,
-            "header": {
-                "title": {"tag": "plain_text", "content": header_text},
-                "template": "green",
-            },
-        }
-
+    # ════════════════════════════════════════════════════════════════
+    #  标签提取
+    # ════════════════════════════════════════════════════════════════
     @staticmethod
-    def _extract_resource_tags(title: str) -> list:
-        """从资源标题中提取可读标签"""
-        tags = []
-        title_lower = title.lower()
+    def _extract_tags(title: str) -> dict:
+        """从资源标题中提取结构化标签"""
+        if not title:
+            return {}
+        tl = title.lower()
+        tags = {}
+
         # 分辨率
-        for kw in ["4K", "2160p", "1080p", "720p"]:
-            if kw.lower() in title_lower:
-                tags.append(kw)
+        for kw, label in [
+            ("2160p", "4K"), ("4k", "4K"), ("uhd", "4K"),
+            ("1080p", "1080p"), ("1080i", "1080p"),
+            ("720p", "720p"),
+        ]:
+            if kw in tl:
+                tags["resolution"] = label
                 break
-        # 编码
-        for kw in ["HEVC", "x265", "x264", "AV1", "H.264", "H.265"]:
-            if kw.lower() in title_lower:
-                tags.append(kw)
+
+        # 视频编码
+        for kw, label in [
+            ("hevc", "HEVC/x265"), ("x265", "HEVC/x265"), ("h.265", "HEVC/x265"), ("h265", "HEVC/x265"),
+            ("x264", "x264"), ("h.264", "x264"), ("h264", "x264"), ("avc", "x264"),
+            ("av1", "AV1"),
+        ]:
+            if kw in tl:
+                tags["video_codec"] = label
                 break
+
         # HDR
-        for kw in ["DV", "Dolby Vision", "HDR10+", "HDR10", "HDR"]:
-            if kw.lower() in title_lower:
-                tags.append(kw)
+        for kw, label in [
+            ("dolby.vision", "Dolby Vision"), ("dolbyvision", "Dolby Vision"),
+            ("dovi", "Dolby Vision"), (".dv.", "Dolby Vision"),
+            ("hdr10+", "HDR10+"), ("hdr10plus", "HDR10+"),
+            ("hdr10", "HDR10"), ("hdr", "HDR"),
+        ]:
+            if kw in tl:
+                tags["hdr"] = label
                 break
-        # 音频
-        for kw in ["Atmos", "TrueHD", "DTS-HD", "DTS", "7.1", "5.1", "AAC"]:
-            if kw.lower() in title_lower:
-                tags.append(kw)
+
+        # 音轨
+        for kw, label in [
+            ("atmos", "Atmos"), ("truehd", "TrueHD"),
+            ("dts-hd", "DTS-HD MA"), ("dts.hd", "DTS-HD MA"), ("dtshdma", "DTS-HD MA"),
+            ("dts-x", "DTS:X"), ("dtsx", "DTS:X"),
+            ("dts", "DTS"),
+            ("ddp5.1", "DD+ 5.1"), ("dd+5.1", "DD+ 5.1"), ("ddp.5.1", "DD+ 5.1"),
+            ("dd5.1", "DD 5.1"),
+            ("7.1", "7.1ch"), ("5.1", "5.1ch"),
+            ("aac", "AAC"), ("flac", "FLAC"),
+        ]:
+            if kw in tl:
+                tags["audio"] = label
                 break
+
         # 来源
-        for kw in ["Remux", "BluRay", "WEB-DL", "WEBRip", "HDTV"]:
-            if kw.lower() in title_lower:
-                tags.append(kw)
+        for kw, label in [
+            ("remux", "Remux"), ("bdremux", "Remux"),
+            ("bluray", "BluRay"), ("blu-ray", "BluRay"),
+            ("web-dl", "WEB-DL"), ("webdl", "WEB-DL"),
+            ("webrip", "WEBRip"), ("web-rip", "WEBRip"),
+            ("hdtv", "HDTV"),
+        ]:
+            if kw in tl:
+                tags["source"] = label
                 break
+
         return tags
 
-    # endregion
+    # ════════════════════════════════════════════════════════════════
+    #  对话历史管理
+    # ════════════════════════════════════════════════════════════════
+    def _get_conversation(self, user_id: str) -> list:
+        """获取用户的对话历史（含 system prompt）"""
+        if user_id not in self._conversations:
+            self._conversations[user_id] = [
+                {"role": "system", "content": _AGENT_SYSTEM_PROMPT}
+            ]
+        return self._conversations[user_id]
 
-    # region ========= 卡片回调处理 =========
+    def _save_conversation(self, user_id: str, messages: list):
+        """保存对话历史，保留最近 N 条（system prompt 始终保留）"""
+        if len(messages) > self._MAX_CONVERSATION_MESSAGES:
+            # 保留 system prompt + 最近的消息
+            system = messages[0]
+            recent = messages[-(self._MAX_CONVERSATION_MESSAGES - 1):]
+            messages = [system] + recent
+        self._conversations[user_id] = messages
 
+    def _clear_conversation(self, user_id: str):
+        """清除用户对话历史"""
+        self._conversations.pop(user_id, None)
+
+    # ════════════════════════════════════════════════════════════════
+    #  卡片回调（兼容 v2.4.0 卡片）
+    # ════════════════════════════════════════════════════════════════
     def _handle_card_action(self, data: dict) -> dict:
-        """处理卡片按钮回调（card.action.trigger）"""
         try:
             action = data.get("event", {}).get("action", {})
             value = action.get("value", {})
@@ -1311,144 +1091,159 @@ class FeishuBot(_PluginBase):
             ctx = data.get("event", {}).get("context", {})
             chat_id = ctx.get("open_chat_id", "") or self._chat_id
 
-            if act == "subscribe":
+            if act == "download_resource":
                 idx = int(value.get("index", 0))
-                cached = self._search_cache.get(user_id, [])
-                if idx < len(cached):
-                    media = cached[idx]
-                    threading.Thread(
-                        target=self._subscribe_media,
-                        args=(media, chat_id, ""),
-                        daemon=True,
-                    ).start()
-
-            elif act == "search_resource":
+                threading.Thread(
+                    target=self._card_download,
+                    args=(idx, user_id, chat_id),
+                    daemon=True,
+                ).start()
+            elif act == "subscribe":
                 idx = int(value.get("index", 0))
-                cached = self._search_cache.get(user_id, [])
-                if idx < len(cached):
-                    media = cached[idx]
-                    title = getattr(media, "title", "") or "未知"
-                    threading.Thread(
-                        target=self._cmd_search_resources,
-                        args=(title, {}, chat_id, "", user_id),
-                        daemon=True,
-                    ).start()
-
-            elif act == "download_resource":
-                idx = int(value.get("index", 0))
-                cached_res = self._search_cache.get(f"{user_id}_res", [])
-                if idx < len(cached_res):
-                    context = cached_res[idx]
-                    threading.Thread(
-                        target=self._do_download,
-                        args=(context, chat_id),
-                        daemon=True,
-                    ).start()
-
+                threading.Thread(
+                    target=self._card_subscribe,
+                    args=(idx, user_id, chat_id),
+                    daemon=True,
+                ).start()
         except Exception as e:
-            logger.error(f"飞书卡片回调异常: {e}", exc_info=True)
+            logger.error(f"卡片回调异常: {e}", exc_info=True)
         return {"code": 0}
 
-    def _do_download(self, context, chat_id: str):
-        """执行下载动作"""
+    def _card_download(self, idx: int, user_id: str, chat_id: str):
+        result = self._tool_download_resource(idx, user_id, chat_id)
+        msg = result.get("message") or result.get("error", "操作失败")
+        icon = "✅" if result.get("success") else "⚠️"
+        self._send_text(chat_id, f"{icon} {msg}")
+
+    def _card_subscribe(self, idx: int, user_id: str, chat_id: str):
+        result = self._tool_subscribe_media(idx, None, user_id)
+        msg = result.get("message") or result.get("error", "操作失败")
+        icon = "✅" if result.get("success") else "⚠️"
+        self._send_text(chat_id, f"{icon} {msg}")
+
+    # ════════════════════════════════════════════════════════════════
+    #  传统模式指令（LLM 未启用时的回退）
+    # ════════════════════════════════════════════════════════════════
+    def _get_user_lock(self, user_id: str):
+        if user_id not in self._user_locks:
+            self._user_locks[user_id] = threading.Lock()
+        return self._user_locks[user_id]
+
+    def _cmd_search(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
+        if not keyword:
+            return
+        self._send_text(chat_id, f"🔍 正在搜索: {keyword} ...", msg_id)
         try:
-            from app.chain.download import DownloadChain
+            from app.chain.media import MediaChain
 
-            dc = DownloadChain()
-            t = getattr(context, "torrent_info", None)
-            title = getattr(t, "title", "未知") if t else "未知"
-            self._send_text(chat_id, f"⬇️ 正在提交下载: {title}")
-
-            result = dc.download_single(context=context, userid="feishu")
-            if result:
-                self._send_text(chat_id, f"✅ 已添加下载: {title}")
-            else:
-                self._send_text(chat_id, f"⚠️ 下载提交失败: {title}")
+            mc = MediaChain()
+            result = mc.search(title=keyword)
+            if not isinstance(result, tuple) or len(result) != 2:
+                self._send_text(chat_id, "⚠️ 搜索返回异常")
+                return
+            meta, medias = result
+            if not medias:
+                name = getattr(meta, "name", keyword) if meta else keyword
+                self._send_text(chat_id, f"😔 未找到: {name}")
+                return
+            valid = [m for m in medias[:6] if hasattr(m, "title")]
+            if not valid:
+                self._send_text(chat_id, "😔 未找到有效结果")
+                return
+            self._search_cache[user_id] = valid
+            lines = []
+            for i, m in enumerate(valid):
+                title = getattr(m, "title", "")
+                year = getattr(m, "year", "")
+                rt = getattr(m, "type", None)
+                mt = "电影" if (rt and hasattr(rt, "value") and rt == MediaType.MOVIE) else "电视剧"
+                vote = getattr(m, "vote_average", "")
+                line = f"{i+1}. {title} ({year}) [{mt}]"
+                if vote:
+                    line += f" ⭐{vote}"
+                lines.append(line)
+            lines.append("\n回复「订阅+序号」如: 订阅1 | 回复「下载+序号」如: 下载1")
+            self._send_text(chat_id, "\n".join(lines), msg_id)
         except Exception as e:
-            logger.error(f"飞书下载异常: {e}", exc_info=True)
-            self._send_text(chat_id, f"⚠️ 下载出错: {e}")
+            logger.error(f"搜索异常: {e}", exc_info=True)
+            self._send_text(chat_id, f"⚠️ 搜索出错: {e}")
 
-    # endregion
+    def _cmd_subscribe(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
+        if not keyword:
+            return
+        self._send_text(chat_id, f"📥 正在订阅: {keyword} ...", msg_id)
+        result = self._tool_subscribe_media(None, keyword, user_id)
+        msg = result.get("message") or result.get("error", "操作失败")
+        icon = "✅" if result.get("success") else "⚠️"
+        self._send_text(chat_id, f"{icon} {msg}")
 
-    # region ========= 订阅 / 通知逻辑 =========
+    def _cmd_downloading(self, chat_id: str, msg_id: str):
+        result = self._tool_get_downloading()
+        tasks = result.get("tasks", [])
+        if not tasks:
+            self._send_text(chat_id, "当前没有正在下载的任务", msg_id)
+            return
+        lines = [f"{i+1}. {t['title']}  进度: {t['progress']}%" for i, t in enumerate(tasks)]
+        self._send_text(chat_id, "\n".join(lines), msg_id)
 
-    def _subscribe_media(self, media, chat_id: str, msg_id: str = None):
-        """真正的订阅动作"""
-        try:
-            from app.chain.subscribe import SubscribeChain
+    def _cmd_help(self, chat_id: str, msg_id: str):
+        agent_on = "✅ 已启用" if self._llm_client else "❌ 未启用"
+        model = self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL
+        self._send_text(
+            chat_id,
+            f"📖 飞书机器人帮助\n\n"
+            f"AI Agent: {agent_on}\n"
+            f"模型: {model}\n\n"
+            f"开启 AI 后直接用自然语言对话：\n"
+            f"• 「流浪地球2」→ 搜索\n"
+            f"• 「找个4K杜比视界的星际穿越」→ 智能筛选资源\n"
+            f"• 「订阅进击的巨人」→ 自动追更\n"
+            f"• 「下载进度怎么样」→ 查看下载\n\n"
+            f"传统指令（始终可用）：\n"
+            f"/搜索 <片名>\n"
+            f"/订阅 <片名>\n"
+            f"/正在下载\n"
+            f"/帮助",
+            msg_id,
+        )
 
-            sc = SubscribeChain()
-            title = getattr(media, "title", "") or "未知"
-            raw_type = getattr(media, "type", None)
-            if raw_type and hasattr(raw_type, "value"):
-                mtype = raw_type
-            else:
-                mtype = MediaType.MOVIE
-
-            sid, msg = sc.add(
-                mtype=mtype,
-                title=title,
-                year=getattr(media, "year", ""),
-                tmdbid=getattr(media, "tmdb_id", None),
-                doubanid=getattr(media, "douban_id", None),
-                exist_ok=True,
-                username="飞书用户",
-            )
-            if sid:
-                self._send_text(chat_id, f"✅ 已订阅: {title}", msg_id)
-            else:
-                self._send_text(chat_id, f"ℹ️ {msg or '订阅失败'}", msg_id)
-        except Exception as e:
-            logger.error(f"飞书订阅动作异常: {e}", exc_info=True)
-            self._send_text(chat_id, f"⚠️ 订阅失败: {e}", msg_id)
-
+    # ════════════════════════════════════════════════════════════════
+    #  事件通知
+    # ════════════════════════════════════════════════════════════════
     @eventmanager.register(EventType.TransferComplete)
     def _on_transfer(self, event: Event):
-        """入库完成"""
-        if not self._enabled or "transfer" not in self._msgtypes:
+        if not self._enabled or "transfer" not in self._msgtypes or not self._chat_id:
             return
         edata = event.event_data or {}
-        mi: Optional[MediaInfo] = edata.get("mediainfo")
+        mi = edata.get("mediainfo")
         if not mi:
             return
         title = getattr(mi, "title", "")
         year = getattr(mi, "year", "")
-        text = f"🎬 入库完成: {title} ({year})" if year else f"🎬 入库完成: {title}"
+        text = f"🎬 入库完成: {title}" + (f" ({year})" if year else "")
         self._send_text(self._chat_id, text)
-        poster = getattr(mi, "poster_url", "")
-        if poster:
-            self._send_image(self._chat_id, poster)
 
     @eventmanager.register(EventType.DownloadAdded)
     def _on_download(self, event: Event):
-        """资源下载"""
-        if not self._enabled or "download" not in self._msgtypes:
+        if not self._enabled or "download" not in self._msgtypes or not self._chat_id:
             return
         edata = event.event_data or {}
         mi = edata.get("mediainfo")
-        context = edata.get("context")
-        title = (
-            getattr(mi, "title", "")
-            if mi
-            else (getattr(context, "title", "") if context else "未知")
-        )
-        text = f"⬇️ 开始下载: {title}"
-        self._send_text(self._chat_id, text)
+        title = getattr(mi, "title", "未知") if mi else "未知"
+        self._send_text(self._chat_id, f"⬇️ 开始下载: {title}")
 
     @eventmanager.register(EventType.SubscribeAdded)
     def _on_subscribe(self, event: Event):
-        """订阅添加"""
-        if not self._enabled or "subscribe" not in self._msgtypes:
+        if not self._enabled or "subscribe" not in self._msgtypes or not self._chat_id:
             return
         edata = event.event_data or {}
         title = edata.get("title") or edata.get("name") or "未知"
-        text = f"📌 新增订阅: {title}"
-        self._send_text(self._chat_id, text)
+        self._send_text(self._chat_id, f"📌 新增订阅: {title}")
 
-    # endregion
-
+    # ════════════════════════════════════════════════════════════════
+    #  生命周期
+    # ════════════════════════════════════════════════════════════════
     def stop_service(self):
-        """退出插件"""
         if self._scheduler:
             self._scheduler.remove_all_jobs()
             if self._scheduler.running:
