@@ -1,5 +1,13 @@
 """
-飞书机器人插件 v3.5.0 — MoviePilot Agent Mode
+飞书机器人插件 v4.0.0 — MoviePilot Agent Mode + WebSocket 长连接
+
+修复记录 (v4.0.0):
+- **核心修复**: 新增 WebSocket 长连接收消息，替代已失效的 HTTP 回调方式
+- 使用 lark-oapi SDK 的 ws.Client 建立长连接，无需公网 IP/域名
+- 插件主动出站连接飞书服务器，NAS/Docker 友好
+- 支持自动重连、Protobuf 解析、心跳保活
+- 保留 HTTP 回调端点作为备用方案
+- 新增 `use_ws` 配置开关（默认开启）
 
 修复记录 (v3.5.0):
 - 修复 get_page 使用不支持的 VCard 组件导致 MoviePilot 插件加载失败
@@ -55,6 +63,22 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaType
 from app.schemas.types import EventType
+
+
+# ╔════════════════════════════════════════════════════════════════════╗
+# ║  0. 飞书 SDK 长连接可用性检测                                      ║
+# ╚════════════════════════════════════════════════════════════════════╝
+
+_HAS_LARK_SDK = False
+try:
+    import lark_oapi as lark
+    from lark_oapi.ws import Client as LarkWSClient
+    from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+    _HAS_LARK_SDK = True
+except ImportError:
+    lark = None
+    LarkWSClient = None
+    EventDispatcherHandler = None
 
 
 # ╔════════════════════════════════════════════════════════════════════╗
@@ -130,7 +154,7 @@ def _extract_tags(title: str) -> dict:
 class _FeishuAPI:
     """飞书 Token 管理 & 消息发送"""
 
-    def __init__(self, app_id: str, app_secret: str):
+    def __init__(self, app_id, app_secret):
         self._app_id = app_id
         self._app_secret = app_secret
         self._token: str = ""
@@ -213,7 +237,7 @@ class _OpenRouterClient:
     BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
     DEFAULT_MODEL = "google/gemini-2.5-flash-preview:free"
 
-    def __init__(self, api_key: str, model: str = ""):
+    def __init__(self, api_key, model: str = ""):
         self.api_key = api_key
         self.model = model or self.DEFAULT_MODEL
 
@@ -517,9 +541,9 @@ class FeishuBot(_PluginBase):
 
     # ── 插件元信息 ──
     plugin_name = "飞书机器人"
-    plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
+    plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "3.5.0"
+    plugin_version = "4.0.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -535,6 +559,7 @@ class FeishuBot(_PluginBase):
     _llm_enabled: bool = False
     _openrouter_key: str = ""
     _openrouter_model: str = ""
+    _use_ws: bool = True  # 新增: 是否使用 WebSocket 长连接
 
     # ── 运行时 ──
     _feishu: Optional[_FeishuAPI] = None
@@ -543,6 +568,11 @@ class FeishuBot(_PluginBase):
     _search_cache: Optional[dict] = None
     _resource_cache: Optional[dict] = None
     _user_locks: Optional[dict] = None
+
+    # ── WebSocket 长连接运行时 ──
+    _ws_client: Optional[Any] = None        # lark_oapi.ws.Client 实例
+    _ws_thread: Optional[threading.Thread] = None
+    _ws_running: bool = False
 
     _MAX_AGENT_ITERATIONS = 10
 
@@ -561,6 +591,17 @@ class FeishuBot(_PluginBase):
             self._app_secret = config.get("app_secret", "")
             self._chat_id = config.get("chat_id", "") or config.get("default_chat_id", "")
             self._msgtypes = config.get("msgtypes") or []
+
+            # WebSocket 长连接开关（默认开启）
+            ws_raw = config.get("use_ws")
+            if ws_raw is None:
+                self._use_ws = True  # 默认开启
+            elif isinstance(ws_raw, bool):
+                self._use_ws = ws_raw
+            elif isinstance(ws_raw, str):
+                self._use_ws = ws_raw.lower() in ("true", "1", "yes", "on")
+            else:
+                self._use_ws = bool(ws_raw)
 
             llm_raw = config.get("llm_enabled")
             if isinstance(llm_raw, bool):
@@ -585,6 +626,7 @@ class FeishuBot(_PluginBase):
         self._agent_count = 0  # Agent 调用计数
         self._legacy_count = 0  # 传统模式调用计数
         self._recover_count = 0  # 运行时恢复次数
+        self._ws_connected = False  # WebSocket 连接状态
 
         # 验证飞书 Token 连通性
         if self._app_id and self._app_secret:
@@ -602,6 +644,7 @@ class FeishuBot(_PluginBase):
 
         logger.info(
             f"飞书配置: enabled={self._enabled}, llm_enabled={self._llm_enabled}, "
+            f"use_ws={self._use_ws}, lark_sdk={'✓' if _HAS_LARK_SDK else '✗'}, "
             f"api_key={'已配置' if self._openrouter_key else '未配置'}, "
             f"model={self._openrouter_model or 'default'}"
         )
@@ -626,6 +669,10 @@ class FeishuBot(_PluginBase):
         else:
             logger.info(f"飞书传统模式（AI Agent 未启用）inst={id(self):#x}")
 
+        # ── 启动 WebSocket 长连接 ──
+        if self._enabled and self._use_ws and self._app_id and self._app_secret:
+            self._start_ws_client()
+
     def get_state(self) -> bool:
         return self._enabled
 
@@ -640,16 +687,167 @@ class FeishuBot(_PluginBase):
             f"inst={id(self):#x}, "
             f"llm_client={'有' if self._llm_client else '无'}, "
             f"feishu={'有' if self._feishu else '无'}, "
+            f"ws_running={self._ws_running}, "
             f"msgs={getattr(self, '_msg_count', '?')}, "
             f"agents={getattr(self, '_agent_count', '?')}, "
             f"recovers={getattr(self, '_recover_count', '?')}"
         )
+
+        # ── 停止 WebSocket 长连接 ──
+        self._stop_ws_client()
+
         self._llm_client = None
         self._conversations = None
         self._feishu = None
         self._search_cache = None
         self._resource_cache = None
         self._user_locks = None
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  WebSocket 长连接管理 (v4.0.0 新增)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _start_ws_client(self):
+        """启动飞书 WebSocket 长连接"""
+        if not _HAS_LARK_SDK:
+            logger.error(
+                "lark-oapi SDK 未安装，无法使用 WebSocket 长连接！"
+                "请在 MoviePilot 容器中执行: pip install lark-oapi 。"
+                "或者关闭 WebSocket 模式，使用 HTTP 回调方式（需公网 IP）。"
+            )
+            return
+
+        if self._ws_running:
+            logger.warning("WebSocket 长连接已在运行中，跳过重复启动")
+            return
+
+        try:
+            # 构建事件处理器
+            event_handler = self._build_event_handler()
+
+            # 创建 lark-oapi WebSocket 客户端
+            self._ws_client = LarkWSClient(
+                self._app_id,
+                self._app_secret,
+                event_handler=event_handler,
+                log_level=lark.LogLevel.INFO,
+            )
+
+            # 在后台线程中启动（ws.Client.start() 是阻塞的）
+            self._ws_running = True
+            self._ws_thread = threading.Thread(
+                target=self._ws_run_loop,
+                name="feishu-ws-client",
+                daemon=True,
+            )
+            self._ws_thread.start()
+
+            logger.info(
+                f"飞书 WebSocket 长连接启动中... "
+                f"inst={id(self):#x}, lark-oapi SDK ✓"
+            )
+        except Exception as e:
+            logger.error(f"飞书 WebSocket 长连接启动失败: {e}", exc_info=True)
+            self._ws_running = False
+
+    def _ws_run_loop(self):
+        """在后台线程中运行 WebSocket 客户端（带自动重连）"""
+        while self._ws_running:
+            try:
+                logger.info("飞书 WebSocket 长连接线程启动")
+                self._ws_connected = True
+                self._ws_client.start()  # 阻塞，直到连接断开
+            except Exception as e:
+                logger.error(f"飞书 WebSocket 长连接异常退出: {e}", exc_info=True)
+            finally:
+                self._ws_connected = False
+
+            if self._ws_running:
+                import time
+                logger.warning("飞书 WebSocket 长连接断开，10 秒后尝试重连...")
+                time.sleep(10)
+
+                # 重新创建客户端实例
+                try:
+                    event_handler = self._build_event_handler()
+                    self._ws_client = LarkWSClient(
+                        self._app_id,
+                        self._app_secret,
+                        event_handler=event_handler,
+                        log_level=lark.LogLevel.INFO,
+                    )
+                except Exception as e:
+                    logger.error(f"WebSocket 客户端重建失败: {e}", exc_info=True)
+                    import time
+                    time.sleep(30)
+
+        logger.info("飞书 WebSocket 长连接线程已退出")
+
+    def _build_event_handler(self) -> "EventDispatcherHandler":
+        """构建 lark-oapi 事件分发处理器"""
+        # 创建闭包引用 self
+        plugin = self
+
+        def on_message_receive(data):
+            """处理接收到的消息事件 (im.message.receive_v1)"""
+            try:
+                logger.info(
+                    f"[WS] 收到消息事件 v{plugin.plugin_version}, "
+                    f"inst={id(plugin):#x}"
+                )
+
+                # 从 lark-oapi 事件对象中提取数据
+                event_data = _json.loads(lark.JSON.marshal(data))
+                event = event_data.get("event", {})
+
+                if not event:
+                    logger.warning("[WS] 消息事件缺少 event 字段")
+                    return
+
+                # 确保运行时对象可用
+                plugin._ensure_runtime_ready()
+
+                # 启动后台线程处理消息
+                threading.Thread(
+                    target=plugin._handle_message,
+                    args=(event,),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                logger.error(f"[WS] 消息事件处理异常: {e}", exc_info=True)
+
+        # 使用 EventDispatcherHandler 构建器注册事件
+        handler = EventDispatcherHandler.builder("", "") \
+            .register_p2_im_message_receive_v1(on_message_receive) \
+            .build()
+
+        return handler
+
+    def _stop_ws_client(self):
+        """停止 WebSocket 长连接"""
+        self._ws_running = False
+        self._ws_connected = False
+
+        if self._ws_client is not None:
+            try:
+                # lark-oapi ws.Client 没有公开的 stop 方法，
+                # 设置 _ws_running=False 后线程退出循环即可
+                logger.info("正在停止飞书 WebSocket 长连接...")
+            except Exception as e:
+                logger.error(f"停止 WebSocket 异常: {e}")
+            finally:
+                self._ws_client = None
+
+        if self._ws_thread is not None:
+            try:
+                self._ws_thread.join(timeout=5)
+            except Exception:
+                pass
+            self._ws_thread = None
+
+        logger.info("飞书 WebSocket 长连接已停止")
+
+    # ══════════════════════════════════════════════════════════════════════
 
     def _ensure_runtime_ready(self):
         """
@@ -699,7 +897,7 @@ class FeishuBot(_PluginBase):
             )
 
     # ══════════════════════════════════════════════════════════════════════
-    #  API 端点
+    #  API 端点（HTTP 回调 — 保留作为备用 / 向下兼容）
     # ══════════════════════════════════════════════════════════════════════
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -708,7 +906,7 @@ class FeishuBot(_PluginBase):
                 "path": "/feishu_event",
                 "endpoint": self._feishu_event,
                 "methods": ["POST"],
-                "summary": "飞书事件回调",
+                "summary": "飞书事件回调（HTTP 备用，推荐使用 WebSocket 长连接）",
             }
         ]
 
@@ -1246,6 +1444,18 @@ class FeishuBot(_PluginBase):
             hours, remainder = divmod(int(delta.total_seconds()), 3600)
             mins, secs = divmod(remainder, 60)
             uptime = f"{hours}h{mins}m{secs}s"
+
+        ws_status = "❌ 未启用"
+        if self._use_ws:
+            if not _HAS_LARK_SDK:
+                ws_status = "⚠️ SDK 未安装"
+            elif self._ws_connected:
+                ws_status = "✅ 已连接"
+            elif self._ws_running:
+                ws_status = "🔄 连接中..."
+            else:
+                ws_status = "❌ 未运行"
+
         self._feishu.send_text(
             chat_id,
             f"🔧 插件诊断 v{self.plugin_version}\n"
@@ -1258,6 +1468,8 @@ class FeishuBot(_PluginBase):
             f"📡 飞书连接\n"
             f"  Token: {'✅ 正常' if getattr(self, '_feishu_ok', False) else '❌ 异常'}\n"
             f"  API 对象: {'✅' if self._feishu else '❌'}\n"
+            f"  WebSocket: {ws_status}\n"
+            f"  lark-oapi: {'✅ 已安装' if _HAS_LARK_SDK else '❌ 未安装'}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 AI Agent\n"
             f"  状态: {'✅ 已激活' if self._llm_client else '❌ 未激活'}\n"
@@ -1278,10 +1490,12 @@ class FeishuBot(_PluginBase):
 
     def _cmd_help(self, chat_id: str, msg_id: str):
         agent_on = "✅ 已启用" if self._llm_client else "❌ 未启用"
+        ws_on = "✅ WebSocket" if (self._use_ws and self._ws_running) else "📡 HTTP 回调"
         self._feishu.send_text(
             chat_id,
             f"📖 飞书机器人帮助\n\n"
-            f"AI Agent: {agent_on}\n\n"
+            f"AI Agent: {agent_on}\n"
+            f"消息通道: {ws_on}\n\n"
             f"开启 AI 后直接用自然语言对话即可。\n"
             f"传统指令：\n"
             f"/搜索 <片名> | /订阅 <片名> | /正在下载 | /帮助",
@@ -1349,22 +1563,40 @@ class FeishuBot(_PluginBase):
                                 {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VSwitch", "props": {"model": "use_ws", "label": "WebSocket 长连接"}},
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                                 {"component": "VTextField", "props": {"model": "app_id", "label": "App ID", "placeholder": "飞书应用 App ID"}},
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                                 {"component": "VTextField", "props": {"model": "app_secret", "label": "App Secret", "placeholder": "飞书应用 App Secret"}},
                             ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {"model": "chat_id", "label": "群 Chat ID", "placeholder": "可选，不填则自动获取"}},
-                            ]},
                         ],
-},
+                    },
                     {
                         "component": "VRow",
-                        "content": [{"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VSelect", "props": {"model": "msgtypes", "label": "通知消息类型", "multiple": True, "chips": True, "items": MsgTypeOptions}},
-                        ]}],
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "chat_id", "label": "群 Chat ID", "placeholder": "可选，不填则自动获取"}},
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VSelect", "props": {"model": "msgtypes", "label": "通知消息类型", "multiple": True, "chips": True, "items": MsgTypeOptions}},
+                            ]},
+                        ],
                     },
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VAlert", "props": {
+                                "type": "info", "variant": "tonal",
+                                "text": (
+                                    "💡 WebSocket 长连接模式（推荐）：无需公网 IP、域名或 HTTPS，NAS/Docker 友好。\n"
+                                    "需安装 lark-oapi：在容器中执行 pip install lark-oapi\n"
+                                    "飞书应用后台 → 事件订阅 → 选择「使用长连接接收」\n\n"
+                                    "关闭 WebSocket 后回退到 HTTP 回调模式（需公网可达地址）。"
+                                ),
+                            }},
+                        ]},
+                    ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VDivider"}]},
                     ]},
@@ -1398,7 +1630,7 @@ class FeishuBot(_PluginBase):
                 ],
             }
         ], {
-            "enabled": False, "app_id": "", "app_secret": "", "chat_id": "",
+            "enabled": False, "use_ws": True, "app_id": "", "app_secret": "", "chat_id": "",
             "msgtypes": ["transfer", "download"],
             "llm_enabled": False, "openrouter_key": "", "openrouter_model": "",
         }
@@ -1422,13 +1654,26 @@ class FeishuBot(_PluginBase):
             except Exception:
                 pass
 
+            # WebSocket 状态
+            ws_status = "未启用"
+            if self._use_ws:
+                if not _HAS_LARK_SDK:
+                    ws_status = "SDK 未安装"
+                elif getattr(self, "_ws_connected", False):
+                    ws_status = "✅ 已连接"
+                elif self._ws_running:
+                    ws_status = "🔄 连接中"
+                else:
+                    ws_status = "❌ 未运行"
+
             # 构建状态文本
             lines = [
                 f"📌 插件 v{self.plugin_version}  |  实例 {id(self):#x}  |  运行 {uptime}",
                 "",
                 f"📡 飞书: Token {'✅ 正常' if feishu_ok else '❌ 异常'}  |  "
                 f"API {'✅' if self._feishu else '❌'}  |  "
-                f"App ID {'✅' if self._app_id else '❌'}",
+                f"App ID {'✅' if self._app_id else '❌'}  |  "
+                f"WS {ws_status}",
                 "",
                 f"🤖 Agent: {'✅ 运行中' if agent_active else ('⚠️ 已启用未激活' if self._llm_enabled else '❌ 未启用')}  |  "
                 f"模型 {model}",
