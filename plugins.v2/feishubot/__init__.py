@@ -1,5 +1,12 @@
 """
-飞书机器人插件 v3.3.0 — MoviePilot Agent Mode
+飞书机器人插件 v3.4.0 — MoviePilot Agent Mode
+
+修复记录 (v3.4.0):
+- 全面增强诊断日志: 所有生命周期方法打印版本号
+- 新增插件详情页实时运行状态仪表板 (get_page)
+- init_plugin 增加飞书 Token 连通性验证
+- _feishu_event 入口添加请求日志
+- _handle_message / _agent_handle 日志增加版本标识
 
 修复记录 (v3.3.0):
 - 增强诊断日志: 所有关键路径添加 instance id 追踪
@@ -506,7 +513,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "3.3.0"
+    plugin_version = "3.4.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -538,7 +545,10 @@ class FeishuBot(_PluginBase):
     # ══════════════════════════════════════════════════════════════════════
 
     def init_plugin(self, config: dict = None):
-        logger.info(f"飞书机器人插件初始化, keys={list(config.keys()) if config else 'None'}")
+        logger.info(
+            f"飞书机器人插件初始化 v{self.plugin_version} "
+            f"inst={id(self):#x}, keys={list(config.keys()) if config else 'None'}"
+        )
         if config:
             self._enabled = config.get("enabled", False)
             self._app_id = config.get("app_id", "")
@@ -563,6 +573,26 @@ class FeishuBot(_PluginBase):
         self._user_locks = {}
         self._llm_client = None
         self._conversations = None
+        self._init_ts = datetime.now()  # 插件初始化时间戳
+        self._feishu_ok = False  # 飞书连通状态
+        self._msg_count = 0  # 消息计数
+        self._agent_count = 0  # Agent 调用计数
+        self._legacy_count = 0  # 传统模式调用计数
+        self._recover_count = 0  # 运行时恢复次数
+
+        # 验证飞书 Token 连通性
+        if self._app_id and self._app_secret:
+            try:
+                token = self._feishu._get_token()
+                if token:
+                    self._feishu_ok = True
+                    logger.info(f"飞书 Token 获取成功 ✓ (token={token[:8]}...)")
+                else:
+                    logger.warning("飞书 Token 获取返回空值 ✗")
+            except Exception as e:
+                logger.error(f"飞书 Token 获取失败 ✗: {e}")
+        else:
+            logger.warning("飞书 App ID / App Secret 未配置")
 
         logger.info(
             f"飞书配置: enabled={self._enabled}, llm_enabled={self._llm_enabled}, "
@@ -600,10 +630,13 @@ class FeishuBot(_PluginBase):
     def stop_service(self):
         """清理运行时资源，防止插件重载时 '占用' 冲突"""
         logger.warning(
-            f"飞书机器人 stop_service 被调用 "
+            f"飞书机器人 stop_service v{self.plugin_version} "
             f"inst={id(self):#x}, "
             f"llm_client={'有' if self._llm_client else '无'}, "
-            f"feishu={'有' if self._feishu else '无'}"
+            f"feishu={'有' if self._feishu else '无'}, "
+            f"msgs={getattr(self, '_msg_count', '?')}, "
+            f"agents={getattr(self, '_agent_count', '?')}, "
+            f"recovers={getattr(self, '_recover_count', '?')}"
         )
         self._llm_client = None
         self._conversations = None
@@ -650,7 +683,11 @@ class FeishuBot(_PluginBase):
                 recovered.append("conversations")
 
         if recovered:
-            logger.warning(f"飞书运行时对象已自动恢复: inst={id(self):#x}, {recovered}")
+            self._recover_count += 1
+            logger.warning(
+                f"飞书运行时对象已自动恢复 (第{self._recover_count}次): "
+                f"inst={id(self):#x}, {recovered}"
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     #  API 端点
@@ -668,7 +705,13 @@ class FeishuBot(_PluginBase):
 
     def _feishu_event(self, request_data: dict = None, **kwargs) -> dict:
         data = request_data or {}
+        evt_type = data.get("type") or data.get("header", {}).get("event_type", "unknown")
+        logger.info(
+            f"飞书回调到达: v{self.plugin_version}, inst={id(self):#x}, "
+            f"type={evt_type}, enabled={self._enabled}"
+        )
         if data.get("type") == "url_verification":
+            logger.info("飞书 URL 验证请求")
             return {"challenge": data.get("challenge", "")}
 
         # 确保运行时对象可用（防御 stop_service 后仍有请求到达）
@@ -722,7 +765,11 @@ class FeishuBot(_PluginBase):
             return
 
         is_agent = self._llm_client is not None and self._conversations is not None
-        logger.info(f"飞书收到: inst={id(self):#x}, user={user_id}, text={text[:80]}")
+        self._msg_count += 1
+        logger.info(
+            f"飞书收到: v{self.plugin_version}, inst={id(self):#x}, "
+            f"msg#{self._msg_count}, user={user_id}, text={text[:80]}"
+        )
         logger.info(
             f"飞书路由: agent={'ON' if is_agent else 'OFF'}, "
             f"llm_enabled={self._llm_enabled}, "
@@ -744,12 +791,14 @@ class FeishuBot(_PluginBase):
 
         # ── Agent 模式：一切交给 LLM ──
         if is_agent:
-            logger.info(f"[Agent] 路由到 Agent: {text[:80]}")
+            self._agent_count += 1
+            logger.info(f"[Agent] 路由到 Agent (#{self._agent_count}): {text[:80]}")
             self._agent_handle(text, chat_id, msg_id, user_id)
             return
 
         # ── 传统模式：指令解析 ──
-        logger.info(f"[Legacy] 路由到传统指令: {text[:80]}")
+        self._legacy_count += 1
+        logger.info(f"[Legacy] 路由到传统指令 (#{self._legacy_count}): {text[:80]}")
         self._legacy_handle(text, chat_id, msg_id, user_id)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1166,15 +1215,39 @@ class FeishuBot(_PluginBase):
         conv = self._conversations.active_users if self._conversations else 0
         cache_media = len(self._search_cache) if self._search_cache else 0
         cache_res = len(self._resource_cache) if self._resource_cache else 0
+        uptime = ""
+        if hasattr(self, "_init_ts") and self._init_ts:
+            delta = datetime.now() - self._init_ts
+            hours, remainder = divmod(int(delta.total_seconds()), 3600)
+            mins, secs = divmod(remainder, 60)
+            uptime = f"{hours}h{mins}m{secs}s"
         self._feishu.send_text(
             chat_id,
             f"🔧 插件诊断 v{self.plugin_version}\n"
-            f"启用: {self._enabled}\n"
-            f"AI Agent: {'✅ 已激活' if self._llm_client else '❌ 未激活'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 基础状态\n"
+            f"  实例: {id(self):#x}\n"
+            f"  启用: {self._enabled}\n"
+            f"  运行时间: {uptime}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 飞书连接\n"
+            f"  Token: {'✅ 正常' if getattr(self, '_feishu_ok', False) else '❌ 异常'}\n"
+            f"  API 对象: {'✅' if self._feishu else '❌'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 AI Agent\n"
+            f"  状态: {'✅ 已激活' if self._llm_client else '❌ 未激活'}\n"
             f"  llm_enabled: {self._llm_enabled}\n"
             f"  api_key: {'已配置' if self._openrouter_key else '未配置'}\n"
-            f"  model: {model}\n"
-            f"  conversations: {conv}\n"
+            f"  模型: {model}\n"
+            f"  对话数: {conv}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 统计\n"
+            f"  消息总数: {getattr(self, '_msg_count', 0)}\n"
+            f"  Agent 调用: {getattr(self, '_agent_count', 0)}\n"
+            f"  传统指令: {getattr(self, '_legacy_count', 0)}\n"
+            f"  运行时恢复: {getattr(self, '_recover_count', 0)}\n"
+            f"  搜索缓存: {cache_media} | 资源缓存: {cache_res}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"指令: /clear 清除对话 | /status 查看状态",
         )
 
@@ -1277,7 +1350,7 @@ class FeishuBot(_PluginBase):
                                 {"component": "VSwitch", "props": {"model": "llm_enabled", "label": "启用 AI Agent"}},
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                {"component": "VTextField", "props": {"model": "openrouter_key", "label": "OpenRouter API Key", "placeholder": "sk-or-v1-..."}},
+                                {"component": "VTextField", "props": {"model": "openrouter_key", "label": "OpenRouter API Key", "placeholder": "sk-or-..."}},
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
                                 {"component": "VTextField", "props": {"model": "openrouter_model", "label": "模型 (可选)", "placeholder": "默认: google/gemini-2.5-flash-preview:free"}},
@@ -1306,7 +1379,120 @@ class FeishuBot(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        return []
+        """插件详情页 — 运行时状态仪表板"""
+        # 运行时间
+        uptime = "未知"
+        if hasattr(self, "_init_ts") and self._init_ts:
+            delta = datetime.now() - self._init_ts
+            hours, remainder = divmod(int(delta.total_seconds()), 3600)
+            mins, secs = divmod(remainder, 60)
+            uptime = f"{hours}h {mins}m {secs}s"
+
+        feishu_ok = getattr(self, "_feishu_ok", False)
+        agent_active = self._llm_client is not None
+        model = self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL
+
+        return [
+            {
+                "component": "VRow",
+                "content": [
+                    # ── 基础信息卡片 ──
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCard", "props": {"variant": "tonal"}, "content": [
+                            {"component": "VCardTitle", "text": "📌 插件信息"},
+                            {"component": "VCardText", "content": [
+                                {"component": "div", "text": f"版本: v{self.plugin_version}"},
+                                {"component": "div", "text": f"实例: {id(self):#x}"},
+                                {"component": "div", "text": f"运行时间: {uptime}"},
+                                {"component": "div", "text": f"启用: {'✅ 是' if self._enabled else '❌ 否'}"},
+                            ]},
+                        ]},
+                    ]},
+                    # ── 飞书连接卡片 ──
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCard", "props": {
+                            "variant": "tonal",
+                            "color": "success" if feishu_ok else "error",
+                        }, "content": [
+                            {"component": "VCardTitle", "text": "📡 飞书连接"},
+                            {"component": "VCardText", "content": [
+                                {"component": "div", "text": f"Token: {'✅ 正常' if feishu_ok else '❌ 异常'}"},
+                                {"component": "div", "text": f"API 对象: {'✅ 就绪' if self._feishu else '❌ 丢失'}"},
+                                {"component": "div", "text": f"App ID: {'已配置' if self._app_id else '未配置'}"},
+                                {"component": "div", "text": f"Chat ID: {self._chat_id[:8] + '...' if self._chat_id and len(self._chat_id) > 8 else self._chat_id or '未设置'}"},
+                            ]},
+                        ]},
+                    ]},
+                    # ── Agent 状态卡片 ──
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCard", "props": {
+                            "variant": "tonal",
+                            "color": "success" if agent_active else ("warning" if self._llm_enabled else "default"),
+                        }, "content": [
+                            {"component": "VCardTitle", "text": "🤖 AI Agent"},
+                            {"component": "VCardText", "content": [
+                                {"component": "div", "text": f"状态: {'✅ 运行中' if agent_active else ('⚠️ 已启用但未激活' if self._llm_enabled else '❌ 未启用')}"},
+                                {"component": "div", "text": f"LLM 开关: {'开' if self._llm_enabled else '关'}"},
+                                {"component": "div", "text": f"API Key: {'已配置' if self._openrouter_key else '❌ 未配置'}"},
+                                {"component": "div", "text": f"模型: {model}"},
+                                {"component": "div", "text": f"对话管理: {'✅' if self._conversations else '❌'}"},
+                            ]},
+                        ]},
+                    ]},
+                ],
+            },
+            # ── 运行统计 ──
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VCard", "props": {"variant": "tonal"}, "content": [
+                            {"component": "VCardTitle", "text": "📊 运行统计"},
+                            {"component": "VCardText", "content": [
+                                {"component": "VRow", "content": [
+                                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                                        {"component": "div", "props": {"class": "text-center"}, "content": [
+                                            {"component": "div", "props": {"class": "text-h5"}, "text": str(getattr(self, '_msg_count', 0))},
+                                            {"component": "div", "props": {"class": "text-caption"}, "text": "消息总数"},
+                                        ]},
+                                    ]},
+                                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                                        {"component": "div", "props": {"class": "text-center"}, "content": [
+                                            {"component": "div", "props": {"class": "text-h5"}, "text": str(getattr(self, '_agent_count', 0))},
+                                            {"component": "div", "props": {"class": "text-caption"}, "text": "Agent 调用"},
+                                        ]},
+                                    ]},
+                                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                                        {"component": "div", "props": {"class": "text-center"}, "content": [
+                                            {"component": "div", "props": {"class": "text-h5"}, "text": str(getattr(self, '_legacy_count', 0))},
+                                            {"component": "div", "props": {"class": "text-caption"}, "text": "传统指令"},
+                                        ]},
+                                    ]},
+                                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                                        {"component": "div", "props": {"class": "text-center"}, "content": [
+                                            {"component": "div", "props": {"class": "text-h5"}, "text": str(getattr(self, '_recover_count', 0))},
+                                            {"component": "div", "props": {"class": "text-caption"}, "text": "运行时恢复"},
+                                        ]},
+                                    ]},
+                                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                                        {"component": "div", "props": {"class": "text-center"}, "content": [
+                                            {"component": "div", "props": {"class": "text-h5"}, "text": str(len(self._search_cache) if self._search_cache else 0)},
+                                            {"component": "div", "props": {"class": "text-caption"}, "text": "搜索缓存"},
+                                        ]},
+                                    ]},
+                                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [
+                                        {"component": "div", "props": {"class": "text-center"}, "content": [
+                                            {"component": "div", "props": {"class": "text-h5"}, "text": str(len(self._resource_cache) if self._resource_cache else 0)},
+                                            {"component": "div", "props": {"class": "text-caption"}, "text": "资源缓存"},
+                                        ]},
+                                    ]},
+                                ]},
+                            ]},
+                        ]},
+                    ]},
+                ],
+            },
+        ]
 
     # ══════════════════════════════════════════════════════════════════════
     #  事件通知
