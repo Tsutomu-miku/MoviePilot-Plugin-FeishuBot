@@ -2,13 +2,14 @@
     "FeishuBot": {
         "name": "飞书机器人",
         "description": "飞书机器人双向通信插件，基于 WebSocket 长连接无需公网IP，支持影视搜索、订阅下载与消息交互，可选 Agent 智能模式",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "icon": "feishu.png",
         "author": "MoviePilot-Community",
         "level": 1,
         "color": "#2B5AED",
         "history": {
-            "v3.0.0": "模块化重构 + Agent 修复：拆分为 8 个模块提升可维护性；修复 Agent 消息格式污染/对话历史腐败/截断破坏配对等致命 Bug；下载操作增加工具层面强制确认机制；修复飞书回复 API 使用方式",
+            "v3.0.1": "单文件架构修复：合并所有模块回 __init__.py 以兼容 MoviePilot 插件加载器（不支持相对导入）；修复 Agent 路由使其正确接管所有会话；保留 v3.0.0 全部 Bug 修复",
+            "v3.0.0": "模块化重构 + Agent 修复：修复 Agent 消息格式污染/对话历史腐败/截断破坏配对等致命 Bug；下载操作增加工具层面强制确认机制；修复飞书回复 API 使用方式",
             "v2.5.1": "Agent 模式诊断修复：健壮布尔解析兼容 VSwitch 字符串值、/status 诊断命令、[Agent]/[Legacy] 路由日志、Agent 循环逐轮日志",
             "v2.5.0": "重构为完整 Agent 架构：LLM 多轮 tool calling 自主编排、结构化工具返回值供 AI 推理、用户对话历史管理、资源标签智能提取",
             "v2.4.0": "新增 AI 智能意图识别（OpenRouter LLM 接入）、自然语言资源筛选（分辨率/声道/编码/来源/字幕）、资源下载卡片交互、帮助信息增强",
