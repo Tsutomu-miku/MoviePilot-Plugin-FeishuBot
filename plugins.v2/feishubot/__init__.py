@@ -232,7 +232,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "2.5.0"
+    plugin_version = "2.5.1"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -264,15 +264,23 @@ class FeishuBot(_PluginBase):
     _MAX_CONVERSATION_MESSAGES = 30
 
     def init_plugin(self, config: dict = None):
+        logger.info(f"飞书机器人插件初始化, config type={type(config)}, keys={list(config.keys()) if config else 'None'}")
         if config:
             self._enabled = config.get("enabled", False)
             self._app_id = config.get("app_id", "")
             self._app_secret = config.get("app_secret", "")
             self._chat_id = config.get("chat_id", "")
             self._msgtypes = config.get("msgtypes") or []
-            self._llm_enabled = config.get("llm_enabled", False)
-            self._openrouter_key = config.get("openrouter_key", "")
-            self._openrouter_model = config.get("openrouter_model", "")
+            # 健壮的布尔解析 — MoviePilot VSwitch 可能存为字符串
+            llm_raw = config.get("llm_enabled")
+            if isinstance(llm_raw, bool):
+                self._llm_enabled = llm_raw
+            elif isinstance(llm_raw, str):
+                self._llm_enabled = llm_raw.lower() in ("true", "1", "yes", "on")
+            else:
+                self._llm_enabled = bool(llm_raw)
+            self._openrouter_key = str(config.get("openrouter_key", "") or "").strip()
+            self._openrouter_model = str(config.get("openrouter_model", "") or "").strip()
 
         self._search_cache = {}
         self._resource_cache = {}
@@ -280,15 +288,29 @@ class FeishuBot(_PluginBase):
         self._user_locks = {}
         self._llm_client = None
 
+        logger.info(
+            f"飞书机器人配置: enabled={self._enabled}, "
+            f"llm_enabled={self._llm_enabled} (raw={config.get('llm_enabled') if config else 'N/A'}), "
+            f"api_key={'已配置(长度'+str(len(self._openrouter_key))+')' if self._openrouter_key else '未配置'}, "
+            f"model={self._openrouter_model or 'default'}"
+        )
+
         if self._llm_enabled and self._openrouter_key:
-            self._llm_client = _OpenRouterClient(
-                api_key=self._openrouter_key,
-                model=self._openrouter_model,
-            )
-            logger.info(
-                f"飞书机器人 Agent 模式已启用，模型: "
-                f"{self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL}"
-            )
+            try:
+                self._llm_client = _OpenRouterClient(
+                    api_key=self._openrouter_key,
+                    model=self._openrouter_model,
+                )
+                logger.info(
+                    f"飞书 Agent 模式已启用 ✓ 模型: "
+                    f"{self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL}"
+                )
+            except Exception as e:
+                logger.error(f"飞书 Agent 客户端创建失败: {e}", exc_info=True)
+        elif self._llm_enabled and not self._openrouter_key:
+            logger.warning("飞书 AI Agent 已启用但 OpenRouter API Key 未配置，回退到传统模式")
+        else:
+            logger.info("飞书传统模式（AI Agent 未启用）")
 
     # ════════════════════════════════════════════════════════════════
     #  表单 / 页面
@@ -602,13 +624,20 @@ class FeishuBot(_PluginBase):
         if not text:
             return
 
-        logger.info(f"飞书收到: user={user_id}, text={text}")
+        logger.info(f"飞书收到: user={user_id}, text={text}, agent_mode={self._llm_client is not None}")
+
+        # ── 诊断指令（始终可用，不经过 LLM）──
+        if text.startswith("/status") or text.startswith("/状态"):
+            self._cmd_status(chat_id, msg_id)
+            return
 
         # ── Agent 模式：一切交给 LLM ──
         if self._llm_client:
+            logger.info(f"[Agent] 路由到 Agent 处理: {text[:50]}")
             self._agent_handle(text, chat_id, msg_id, user_id)
             return
 
+        logger.info(f"[Legacy] 路由到传统指令处理: {text[:50]}")
         # ── 传统模式：指令解析 ──
         if text.startswith("/帮助") or text.startswith("/help"):
             self._cmd_help(chat_id, msg_id)
@@ -674,9 +703,16 @@ class FeishuBot(_PluginBase):
 
             choice = result.get("choices", [{}])[0]
             message = choice.get("message", {})
+            finish_reason = choice.get("finish_reason", "")
 
             # 检查是否有 tool_calls
             tool_calls = message.get("tool_calls")
+
+            logger.info(
+                f"Agent 第{iteration+1}轮: finish_reason={finish_reason}, "
+                f"tool_calls={len(tool_calls) if tool_calls else 0}, "
+                f"has_content={bool(message.get('content'))}"
+            )
 
             if not tool_calls:
                 # LLM 返回了最终文本回复
@@ -1204,6 +1240,23 @@ class FeishuBot(_PluginBase):
             f"/订阅 <片名>\n"
             f"/正在下载\n"
             f"/帮助",
+            msg_id,
+        )
+
+    def _cmd_status(self, chat_id: str, msg_id: str):
+        """诊断状态"""
+        model = self._openrouter_model or _OpenRouterClient.DEFAULT_MODEL
+        self._send_text(
+            chat_id,
+            f"🔧 插件诊断\n"
+            f"版本: {self.plugin_version}\n"
+            f"启用: {self._enabled}\n"
+            f"AI Agent: {'✅ 已激活' if self._llm_client else '❌ 未激活'}\n"
+            f"  llm_enabled: {self._llm_enabled}\n"
+            f"  api_key: {'已配置' if self._openrouter_key else '未配置'}\n"
+            f"  model: {model}\n"
+            f"  client: {type(self._llm_client).__name__ if self._llm_client else 'None'}\n"
+            f"对话缓存: {len(self._conversations)} 个用户",
             msg_id,
         )
 
