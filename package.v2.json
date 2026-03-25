@@ -1,29 +1,23 @@
 {
-    "FeishuBot": {
-        "name": "飞书机器人",
-        "description": "飞书机器人双向通信插件 v3.4.0，基于 WebSocket 长连接无需公网IP，支持影视搜索、订阅下载与消息交互，可选 Agent 智能模式；v3.4.0 全面增强诊断日志 + 插件详情状态仪表板 + 飞书连通验证",
-        "version": "3.4.0",
-        "icon": "feishu.png",
-        "author": "MoviePilot-Community",
-        "level": 1,
-        "color": "#2B5AED",
-        "history": {
-            "v3.4.0": "v3.4.0: 全面增强诊断日志 + 插件详情状态仪表板 + 飞书连通验证",
-            "v3.3.0": "v3.3.0: 增强诊断日志 + 实例追踪 + Agent 耗时统计",
-            "v3.2.0": "增强诊断日志 + 实例追踪 + Agent 耗时统计：拆分路由日志为两行避免 MoviePilot UI 截断；所有关键路径添加 instance id 追踪；Agent 处理添加 elapsed 耗时统计；stop_service 日志升级为 warning 级别；_ensure_runtime_ready 恢复日志添加 instance id",
-            "v3.1.1": "修复 Agent 模式因 stop_service 后运行时对象丢失导致回退传统模式；新增 _ensure_runtime_ready 惰性恢复机制防御生命周期异常；修复群聊 @提及标记未清理；stop_service 新增日志输出便于排查",
-            "v3.1.0": "关键修复：get_command/get_page 返回 None 导致插件加载占用；旧配置 default_chat_id 键名不兼容；搜索结果 str 对象被误当 MediaInfo（str.title 方法引用）；stop_service 清理运行时资源；类级别可变默认值改为实例初始化",
-            "v3.0.1": "单文件架构修复：合并所有模块回 __init__.py 以兼容 MoviePilot 插件加载器（不支持相对导入）；修复 Agent 路由使其正确接管所有会话；保留 v3.0.0 全部 Bug 修复",
-            "v3.0.0": "模块化重构 + Agent 修复：修复 Agent 消息格式污染/对话历史腐败/截断破坏配对等致命 Bug；下载操作增加工具层面强制确认机制；修复飞书回复 API 使用方式",
-            "v2.5.1": "Agent 模式诊断修复：健壮布尔解析兼容 VSwitch 字符串值、/status 诊断命令、[Agent]/[Legacy] 路由日志、Agent 循环逐轮日志",
-            "v2.5.0": "重构为完整 Agent 架构：LLM 多轮 tool calling 自主编排、结构化工具返回值供 AI 推理、用户对话历史管理、资源标签智能提取",
-            "v2.4.0": "新增 AI 智能意图识别（OpenRouter LLM 接入）、自然语言资源筛选（分辨率/声道/编码/来源/字幕）、资源下载卡片交互、帮助信息增强",
-            "v2.3.1": "增加用户锁防并发冲突、防御性类型验证所有 Chain 返回值、订阅优先使用 search() 替代 recognize_by_meta()",
-            "v2.3.0": "修复 MediaChain API 调用：search() 返回元组解包、recognize_by_meta 传入 MetaBase、search_by_title 去除无效参数",
-            "v2.2.0": "修复 SDK 模式下 event loop is already running 冲突；统一 WebSocket 线程入口架构；优化回退逻辑",
-            "v2.1.0": "内置 Protobuf 解析器，修复二进制帧解码错误；支持消息分片重组；无需任何额外依赖即可运行",
-            "v2.0.0": "架构重构：使用飞书 WebSocket 长连接替代 Webhook，无需公网IP",
-            "v1.0.0": "首个版本：基于 Webhook 的双向通信"
-        }
+  "FeishuBot": {
+    "name": "飞书机器人",
+    "description": "飞书机器人通知与交互插件，支持 Agent 智能对话模式",
+    "labels": "消息通知",
+    "version": "3.5.0",
+    "icon": "https://open.feishu.cn/favicon.ico",
+    "author": "Tsutomu",
+    "level": 1,
+    "history": {
+      "v1.0.0": "初始版本：飞书机器人消息通知",
+      "v2.0.0": "新增搜索、订阅、下载等交互指令",
+      "v3.0.0": "新增 Agent 智能对话模式（OpenRouter LLM + 工具调用）",
+      "v3.0.1": "合并单文件 + 修复 Agent 消息格式/对话历史/工具确认等问题",
+      "v3.1.0": "修复 get_command/get_page 返回 None 导致加载异常 + 旧配置兼容 + 搜索 Bug",
+      "v3.1.1": "修复 Agent 模式 stop_service 后运行时丢失 + 新增惰性恢复机制",
+      "v3.2.0": "增强诊断日志: instance id 追踪 + 路由日志拆分 + Agent 耗时统计",
+      "v3.3.0": "版本号三处同步修复 + 全面对齐 plugin_version/package/docstring",
+      "v3.4.0": "全面增强诊断日志 + 新增运行状态仪表板 + 飞书Token连通性验证",
+      "v3.5.0": "修复 get_page VCard 组件崩溃 + 事件/消息顶层异常捕获 + 计数器安全访问"
     }
+  }
 }
