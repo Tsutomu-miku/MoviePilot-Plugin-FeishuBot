@@ -1,13 +1,14 @@
 {
     "FeishuBot": {
         "name": "飞书机器人",
-        "description": "飞书机器人双向通信插件 v3.2.0，基于 WebSocket 长连接无需公网IP，支持影视搜索、订阅下载与消息交互，可选 Agent 智能模式；v3.2.0 增强诊断日志、实例追踪与 Agent 耗时统计",
-        "version": "3.2.0",
+        "description": "飞书机器人双向通信插件 v3.3.0，基于 WebSocket 长连接无需公网IP，支持影视搜索、订阅下载与消息交互，可选 Agent 智能模式；v3.3.0 增强诊断日志、实例追踪与 Agent 耗时统计",
+        "version": "3.3.0",
         "icon": "feishu.png",
         "author": "MoviePilot-Community",
         "level": 1,
         "color": "#2B5AED",
         "history": {
+            "v3.3.0": "v3.3.0: 增强诊断日志 + 实例追踪 + Agent 耗时统计",
             "v3.2.0": "增强诊断日志 + 实例追踪 + Agent 耗时统计：拆分路由日志为两行避免 MoviePilot UI 截断；所有关键路径添加 instance id 追踪；Agent 处理添加 elapsed 耗时统计；stop_service 日志升级为 warning 级别；_ensure_runtime_ready 恢复日志添加 instance id",
             "v3.1.1": "修复 Agent 模式因 stop_service 后运行时对象丢失导致回退传统模式；新增 _ensure_runtime_ready 惰性恢复机制防御生命周期异常；修复群聊 @提及标记未清理；stop_service 新增日志输出便于排查",
             "v3.1.0": "关键修复：get_command/get_page 返回 None 导致插件加载占用；旧配置 default_chat_id 键名不兼容；搜索结果 str 对象被误当 MediaInfo（str.title 方法引用）；stop_service 清理运行时资源；类级别可变默认值改为实例初始化",

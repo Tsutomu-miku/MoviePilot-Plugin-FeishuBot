@@ -1,7 +1,7 @@
 """
-飞书机器人插件 v3.2.0 — MoviePilot Agent Mode
+飞书机器人插件 v3.3.0 — MoviePilot Agent Mode
 
-修复记录 (v3.2.0):
+修复记录 (v3.3.0):
 - 增强诊断日志: 所有关键路径添加 instance id 追踪
 - 拆分路由日志避免 MoviePilot UI 截断
 - Agent 处理添加耗时统计
@@ -506,7 +506,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "3.2.0"
+    plugin_version = "3.3.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
