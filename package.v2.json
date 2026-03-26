@@ -22,7 +22,8 @@
       "v4.0.1": "修复 WebSocket 线程与 FastAPI/uvicorn 事件循环冲突",
       "v5.0.0": "Agent 并发控制重构 + 即时反馈卡片 + 飞书交互式卡片全面升级",
       "v5.1.0": "消息去重(msg_id幂等) + 并发竞态修复(dispatch_lock) + 即时反馈增强 + 卡片样式优化",
-      "v5.1.1": "Agent 并发修复(_user_processing 状态 + dispatch_lock 保护) + 下载容错增强 + System Prompt 上下文理解指令"
+      "v5.1.1": "Agent 并发修复(_user_processing 状态 + dispatch_lock 保护) + 下载容错增强 + System Prompt 上下文理解指令",
+      "v5.1.2": "触发更新"
     }
   }
 }
