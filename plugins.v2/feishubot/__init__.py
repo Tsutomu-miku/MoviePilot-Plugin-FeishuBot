@@ -1,5 +1,5 @@
 """
-飞书机器人插件 v5.1.1 — MoviePilot Agent Mode + WebSocket 长连接
+飞书机器人插件 v5.1.2 — MoviePilot Agent Mode + WebSocket 长连接
 
 更新记录 (v5.1.1):
 - **消息去重**: 基于 message_id 的幂等处理, 同一消息无论来自 WS 还是 HTTP 回调只处理一次
@@ -106,7 +106,7 @@ try:
     from lark_oapi.ws import Client as LarkWSClient
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     _HAS_LARK_SDK = True
-except ImportError:
+except Exception:
     lark = None
     LarkWSClient = None
     EventDispatcherHandler = None
@@ -956,7 +956,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "5.1.2"
+    plugin_version = "5.1.3"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -1043,6 +1043,7 @@ class FeishuBot(_PluginBase):
         self._user_interrupted = {}
         self._user_processing = {}
         self._seen_msg_ids = {}
+        self._dispatch_lock = threading.Lock()  # 实例级锁，避免 reload 共享
         self._llm_client = None
         self._conversations = None
         self._init_ts = datetime.now()
@@ -1367,109 +1368,109 @@ class FeishuBot(_PluginBase):
     # ══════════════════════════════════════════════════════════════════════
 
     def _handle_message(self, event: dict):
-      try:
-        msg = event.get("message", {})
-        chat_id = msg.get("chat_id", "") or self._chat_id
-        msg_id = msg.get("message_id", "")
-        msg_type = msg.get("message_type", "")
-        sender = event.get("sender", {}).get("sender_id", {})
-        user_id = sender.get("open_id", "")
+        try:
+            msg = event.get("message", {})
+            chat_id = msg.get("chat_id", "") or self._chat_id
+            msg_id = msg.get("message_id", "")
+            msg_type = msg.get("message_type", "")
+            sender = event.get("sender", {}).get("sender_id", {})
+            user_id = sender.get("open_id", "")
 
-        self._ensure_runtime_ready()
+            self._ensure_runtime_ready()
 
-        # ── 消息去重: 同一条消息只处理一次 (防止 WS + HTTP 双通道重复) ──
-        if msg_id and self._seen_msg_ids is not None:
-            now = _time.monotonic()
-            if msg_id in self._seen_msg_ids:
-                logger.info(f"[去重] 跳过重复消息 {msg_id}")
+            # ── 消息去重: 同一条消息只处理一次 (防止 WS + HTTP 双通道重复) ──
+            if msg_id and self._seen_msg_ids is not None:
+                now = _time.monotonic()
+                if msg_id in self._seen_msg_ids:
+                    logger.info(f"[去重] 跳过重复消息 {msg_id}")
+                    return
+                self._seen_msg_ids[msg_id] = now
+                # 清理超过 5 分钟的旧记录防止内存泄漏
+                if len(self._seen_msg_ids) > 200:
+                    cutoff = now - 300
+                    self._seen_msg_ids = {
+                        k: v for k, v in self._seen_msg_ids.items() if v > cutoff
+                    }
+
+            if msg_type != "text":
+                if self._feishu:
+                    self._feishu.send_card(
+                        chat_id,
+                        _CardBuilder.error_card("暂时只支持文字消息哦~")
+                    )
                 return
-            self._seen_msg_ids[msg_id] = now
-            # 清理超过 5 分钟的旧记录防止内存泄漏
-            if len(self._seen_msg_ids) > 200:
-                cutoff = now - 300
-                self._seen_msg_ids = {
-                    k: v for k, v in self._seen_msg_ids.items() if v > cutoff
-                }
 
-        if msg_type != "text":
-            if self._feishu:
-                self._feishu.send_card(
-                    chat_id,
-                    _CardBuilder.error_card("暂时只支持文字消息哦~")
-                )
-            return
-
-        try:
-            text = _json.loads(msg.get("content", "{}")).get("text", "").strip()
-        except Exception:
-            text = ""
-
-        # ── 清理飞书 @提及标记 ──
-        mentions = msg.get("mentions")
-        if mentions:
-            for m in mentions:
-                key = m.get("key", "")
-                if key:
-                    text = text.replace(key, "").strip()
-
-        if not text:
-            return
-
-        is_agent = self._llm_client is not None and self._conversations is not None
-        try:
-            self._msg_count = getattr(self, "_msg_count", 0) + 1
-        except Exception:
-            pass
-        logger.info(
-            f"飞书收到: v{self.plugin_version}, inst={id(self):#x}, "
-            f"msg#{self._msg_count}, user={user_id}, text={text[:80]}"
-        )
-        logger.info(
-            f"飞书路由: agent={'ON' if is_agent else 'OFF'}, "
-            f"llm_enabled={self._llm_enabled}, "
-            f"llm_client={type(self._llm_client).__name__}, "
-            f"conv={type(self._conversations).__name__}"
-        )
-
-        # ── 始终可用的指令 ──
-        if text.startswith("/status") or text.startswith("/状态"):
-            self._cmd_status(chat_id, msg_id)
-            return
-
-        if text in ("/clear", "/清除", "清除对话", "重新开始"):
-            if self._conversations:
-                self._conversations.clear(user_id)
-            if self._feishu:
-                self._feishu.send_card(
-                    chat_id,
-                    _CardBuilder.notify_card("🗑️ 对话已清除", "历史会话已重置，可以开始新的对话。", "green"),
-                    reply_msg_id=msg_id,
-                )
-            return
-
-        if text.startswith("/help") or text.startswith("/帮助"):
-            self._cmd_help(chat_id, msg_id)
-            return
-
-        # ── Agent 模式：消息队列 + 打断机制 ──
-        if is_agent:
             try:
-                self._agent_count = getattr(self, "_agent_count", 0) + 1
+                text = _json.loads(msg.get("content", "{}")).get("text", "").strip()
+            except Exception:
+                text = ""
+
+            # ── 清理飞书 @提及标记 ──
+            mentions = msg.get("mentions")
+            if mentions:
+                for m in mentions:
+                    key = m.get("key", "")
+                    if key:
+                        text = text.replace(key, "").strip()
+
+            if not text:
+                return
+
+            is_agent = self._llm_client is not None and self._conversations is not None
+            try:
+                self._msg_count = getattr(self, "_msg_count", 0) + 1
             except Exception:
                 pass
-            logger.info(f"[Agent] 路由到 Agent (#{self._agent_count}): {text[:80]}")
-            self._agent_dispatch(text, chat_id, msg_id, user_id)
-            return
+            logger.info(
+                f"飞书收到: v{self.plugin_version}, inst={id(self):#x}, "
+                f"msg#{self._msg_count}, user={user_id}, text={text[:80]}"
+            )
+            logger.info(
+                f"飞书路由: agent={'ON' if is_agent else 'OFF'}, "
+                f"llm_enabled={self._llm_enabled}, "
+                f"llm_client={type(self._llm_client).__name__}, "
+                f"conv={type(self._conversations).__name__}"
+            )
 
-        # ── 传统模式 ──
-        try:
-            self._legacy_count = getattr(self, "_legacy_count", 0) + 1
-        except Exception:
-            pass
-        logger.info(f"[Legacy] 路由到传统指令 (#{self._legacy_count}): {text[:80]}")
-        self._legacy_handle(text, chat_id, msg_id, user_id)
-      except Exception as _exc:
-        logger.error(f"_handle_message 顶层异常: {_exc}", exc_info=True)
+            # ── 始终可用的指令 ──
+            if text.startswith("/status") or text.startswith("/状态"):
+                self._cmd_status(chat_id, msg_id)
+                return
+
+            if text in ("/clear", "/清除", "清除对话", "重新开始"):
+                if self._conversations:
+                    self._conversations.clear(user_id)
+                if self._feishu:
+                    self._feishu.send_card(
+                        chat_id,
+                        _CardBuilder.notify_card("🗑️ 对话已清除", "历史会话已重置，可以开始新的对话。", "green"),
+                        reply_msg_id=msg_id,
+                    )
+                return
+
+            if text.startswith("/help") or text.startswith("/帮助"):
+                self._cmd_help(chat_id, msg_id)
+                return
+
+            # ── Agent 模式：消息队列 + 打断机制 ──
+            if is_agent:
+                try:
+                    self._agent_count = getattr(self, "_agent_count", 0) + 1
+                except Exception:
+                    pass
+                logger.info(f"[Agent] 路由到 Agent (#{self._agent_count}): {text[:80]}")
+                self._agent_dispatch(text, chat_id, msg_id, user_id)
+                return
+
+            # ── 传统模式 ──
+            try:
+                self._legacy_count = getattr(self, "_legacy_count", 0) + 1
+            except Exception:
+                pass
+            logger.info(f"[Legacy] 路由到传统指令 (#{self._legacy_count}): {text[:80]}")
+            self._legacy_handle(text, chat_id, msg_id, user_id)
+        except Exception as _exc:
+            logger.error(f"_handle_message 顶层异常: {_exc}", exc_info=True)
 
     # ══════════════════════════════════════════════════════════════════════
     #  Agent 并发控制 (v5.0.0 新增 — 消息队列 + 打断机制)
@@ -1502,15 +1503,24 @@ class FeishuBot(_PluginBase):
         if self._seen_msg_ids is None:
             self._seen_msg_ids = {}
 
-        is_processing = self._user_processing.get(user_id, False)
+        with self._dispatch_lock:
+            is_processing = self._user_processing.get(user_id, False)
 
-        if is_processing:
-            # ── 用户在 Agent 处理期间又发了新消息 → 标记打断 ──
-            self._user_pending_msg[user_id] = (text, chat_id, msg_id)
-            self._user_interrupted[user_id] = True
-            logger.info(f"[Agent] 用户 {user_id} 打断: 存储新消息 '{text[:40]}'")
+            if is_processing:
+                # ── 用户在 Agent 处理期间又发了新消息 → 标记打断 ──
+                self._user_pending_msg[user_id] = (text, chat_id, msg_id)
+                self._user_interrupted[user_id] = True
+                logger.info(f"[Agent] 用户 {user_id} 打断: 存储新消息 '{text[:40]}'")
+                _need_interrupt_card = True
+            else:
+                _need_interrupt_card = False
+                # ── 没有正在处理的任务 → 等待合并窗口后启动 ──
+                self._user_pending_msg[user_id] = (text, chat_id, msg_id)
+                self._user_interrupted[user_id] = False
+                self._user_processing[user_id] = True
 
-            # 给用户即时反馈
+        if _need_interrupt_card:
+            # 给用户即时反馈（锁外执行，避免长时间持锁）
             if self._feishu:
                 self._feishu.send_card(
                     chat_id,
@@ -1518,11 +1528,6 @@ class FeishuBot(_PluginBase):
                     reply_msg_id=msg_id,
                 )
             return
-
-        # ── 没有正在处理的任务 → 等待合并窗口后启动 ──
-        self._user_pending_msg[user_id] = (text, chat_id, msg_id)
-        self._user_interrupted[user_id] = False
-        self._user_processing[user_id] = True
 
         threading.Thread(
             target=self._agent_merge_and_run,
