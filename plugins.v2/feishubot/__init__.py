@@ -1,5 +1,20 @@
 """
-飞书机器人插件 v4.0.1 — MoviePilot Agent Mode + WebSocket 长连接
+飞书机器人插件 v5.0.0 — MoviePilot Agent Mode + WebSocket 长连接
+
+更新记录 (v5.0.0):
+- **Agent 并发控制重构**: 用户连续发消息不再触发多轮并行回复
+  - 新增消息队列机制: 用户快速发送的多条消息自动合并为一次请求
+  - 新增 "打断" 逻辑: 用户在 Agent 处理期间发新消息会标记打断, 当前轮次完成后
+    立即使用最新消息重新开始, 而非排队等待
+  - 移除旧的 lock.acquire(blocking=False) 拒绝策略
+- **即时反馈**: 收到消息后立即发送 "处理中" 卡片, 让用户知道请求已收到
+- **飞书卡片全面重构**: 所有输出改用 interactive card, 大幅提升信息密度
+  - 搜索结果: 多列布局 + 评分标签 + 操作按钮
+  - 资源列表: 标签化展示分辨率/编码/音轨/来源
+  - 下载进度: 进度条可视化
+  - 状态诊断: 结构化仪表板卡片
+  - Agent 最终回复: 带 header 的 markdown 卡片
+- **系统提示词优化**: 适配新的卡片输出, Agent 回复更结构化
 
 修复记录 (v4.0.1):
 - 修复 WebSocket 长连接因 asyncio event loop 冲突导致无法启动
@@ -58,6 +73,7 @@
 import json as _json
 import re
 import threading
+import time as _time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -213,23 +229,387 @@ class _FeishuAPI:
         except Exception as e:
             logger.error(f"飞书发送异常: {e}")
 
-    def send_card(self, chat_id: str, card: dict):
-        body = {
-            "receive_id": chat_id,
-            "msg_type": "interactive",
-            "content": _json.dumps(card, ensure_ascii=False),
-        }
+    def send_card(self, chat_id: str, card: dict, reply_msg_id: str = None):
+        """发送卡片消息。支持 reply_msg_id 回复。"""
+        content = _json.dumps(card, ensure_ascii=False)
+
+        if reply_msg_id:
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{reply_msg_id}/reply"
+            body = {"msg_type": "interactive", "content": content}
+            params = {}
+        else:
+            url = "https://open.feishu.cn/open-apis/im/v1/messages"
+            body = {
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": content,
+            }
+            params = {"receive_id_type": "chat_id"}
+
         try:
             resp = requests.post(
-                "https://open.feishu.cn/open-apis/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
-                headers=self._headers(), json=body, timeout=10,
+                url, params=params, headers=self._headers(),
+                json=body, timeout=10,
             )
             result = resp.json()
             if result.get("code") != 0:
                 logger.warning(f"飞书卡片发送失败: {result}")
+            return result
         except Exception as e:
             logger.error(f"飞书发送卡片异常: {e}")
+            return {}
+
+    def update_card(self, message_id: str, card: dict):
+        """更新已发送的卡片消息（用于状态更新）"""
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
+        body = {
+            "msg_type": "interactive",
+            "content": _json.dumps(card, ensure_ascii=False),
+        }
+        try:
+            resp = requests.patch(
+                url, headers=self._headers(), json=body, timeout=10,
+            )
+            result = resp.json()
+            if result.get("code") != 0:
+                logger.warning(f"飞书卡片更新失败: {result}")
+        except Exception as e:
+            logger.error(f"飞书更新卡片异常: {e}")
+
+
+# ╔════════════════════════════════════════════════════════════════════╗
+# ║  2.5 飞书卡片构建器                                                ║
+# ╚════════════════════════════════════════════════════════════════════╝
+
+class _CardBuilder:
+    """飞书 Interactive Card 构建工具集"""
+
+    @staticmethod
+    def _md(text: str) -> dict:
+        """构建 markdown 元素"""
+        return {"tag": "markdown", "content": text}
+
+    @staticmethod
+    def _hr() -> dict:
+        return {"tag": "hr"}
+
+    @staticmethod
+    def _header(title: str, template: str = "blue", icon: str = "") -> dict:
+        """构建卡片 header"""
+        h = {
+            "title": {"tag": "plain_text", "content": title},
+            "template": template,
+        }
+        if icon:
+            h["icon"] = {"tag": "standard_icon", "token": icon}
+        return h
+
+    @staticmethod
+    def _button(text: str, value: dict, btn_type: str = "primary") -> dict:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": text},
+            "type": btn_type,
+            "value": value,
+        }
+
+    @staticmethod
+    def _action(buttons: list) -> dict:
+        return {"tag": "action", "actions": buttons}
+
+    @staticmethod
+    def _column_set(columns: list, flex_mode: str = "none") -> dict:
+        return {
+            "tag": "column_set",
+            "flex_mode": flex_mode,
+            "background_style": "default",
+            "columns": columns,
+        }
+
+    @staticmethod
+    def _column(elements: list, weight: int = 1, vertical_align: str = "top") -> dict:
+        return {
+            "tag": "column",
+            "width": "weighted",
+            "weight": weight,
+            "vertical_align": vertical_align,
+            "elements": elements,
+        }
+
+    @staticmethod
+    def _note(text: str) -> dict:
+        """底部备注（用 div + notation 模拟）"""
+        return {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": text},
+        }
+
+    @classmethod
+    def wrap(cls, header_title: str, elements: list,
+             template: str = "blue", icon: str = "") -> dict:
+        """包装完整卡片"""
+        return {
+            "header": cls._header(header_title, template, icon),
+            "elements": elements,
+        }
+
+    # ── 高级卡片工厂 ──
+
+    @classmethod
+    def processing_card(cls, user_text: str) -> dict:
+        """'正在处理' 占位卡片"""
+        elements = [
+            cls._md(f"**收到指令** ➜ {user_text[:60]}{'...' if len(user_text) > 60 else ''}"),
+            cls._hr(),
+            cls._md("⏳ **正在处理中...**\n\n> AI 正在理解你的需求并调用工具"),
+        ]
+        return cls.wrap("🤖 MoviePilot AI", elements, template="indigo")
+
+    @classmethod
+    def agent_reply_card(cls, reply_text: str, elapsed: float = 0) -> dict:
+        """Agent 最终回复卡片"""
+        footer = f"\n\n---\n⏱ 耗时 {elapsed:.1f}s" if elapsed > 0 else ""
+        elements = [
+            cls._md(reply_text + footer),
+        ]
+        return cls.wrap("🤖 MoviePilot AI", elements, template="blue")
+
+    @classmethod
+    def agent_tool_progress_card(
+        cls, user_text: str, steps: list, current_step: str = ""
+    ) -> dict:
+        """Agent 工具调用进度卡片（实时更新）"""
+        lines = [f"**指令** ➜ {user_text[:60]}{'...' if len(user_text) > 60 else ''}\n"]
+        for s in steps:
+            lines.append(f"✅ {s}")
+        if current_step:
+            lines.append(f"🔄 {current_step}...")
+        elements = [cls._md("\n".join(lines))]
+        return cls.wrap("🤖 处理进度", elements, template="indigo")
+
+    @classmethod
+    def search_result_card(cls, keyword: str, results: list) -> dict:
+        """搜索结果卡片 — 多列信息密度布局"""
+        if not results:
+            return cls.wrap("🔍 搜索结果", [cls._md(f"未找到「{keyword}」相关结果")], template="grey")
+
+        elements = [cls._md(f"搜索「**{keyword}**」找到 {len(results)} 个结果：\n")]
+
+        for item in results[:8]:
+            idx = item.get("index", 0) + 1
+            title = item.get("title", "未知")
+            year = item.get("year", "")
+            mtype = item.get("type", "")
+            rating = item.get("rating", "")
+            overview = item.get("overview", "")
+
+            # 标题行
+            rating_str = f"  ⭐ **{rating}**" if rating else ""
+            type_str = f"`{mtype}`" if mtype else ""
+            header_line = f"**{idx}. {title}** ({year}) {type_str}{rating_str}"
+
+            # 简介（截断）
+            desc = overview[:80] + "..." if len(overview) > 80 else overview
+            if desc:
+                header_line += f"\n> {desc}"
+
+            elements.append(cls._md(header_line))
+
+            # 操作按钮
+            btns = [
+                cls._button("📥 订阅", {"action": "subscribe", "index": item.get("index", 0)}, "primary"),
+                cls._button("🔍 搜资源", {"action": "search_resources_by_title", "keyword": title}, "default"),
+            ]
+            elements.append(cls._action(btns))
+
+            if idx < len(results):
+                elements.append(cls._hr())
+
+        return cls.wrap("🔍 搜索结果", elements, template="blue")
+
+    @classmethod
+    def resource_result_card(cls, keyword: str, title: str, results: list) -> dict:
+        """资源列表卡片 — 标签化 + 高信息密度"""
+        if not results:
+            return cls.wrap("📦 资源搜索", [cls._md(f"未找到「{title}」的下载资源")], template="grey")
+
+        elements = [
+            cls._md(f"「**{title}**」共 {len(results)} 个资源：\n"),
+        ]
+
+        for item in results[:10]:
+            idx = item.get("index", 0) + 1
+            tname = item.get("title", "未知")
+            site = item.get("site", "")
+            size = item.get("size", "")
+            seeders = item.get("seeders", "")
+            tags = item.get("tags", {})
+
+            # 用 text_tag 风格展示标签
+            tag_parts = []
+            if tags.get("resolution"):
+                tag_parts.append(f"`{tags['resolution']}`")
+            if tags.get("video_codec"):
+                tag_parts.append(f"`{tags['video_codec']}`")
+            if tags.get("hdr"):
+                tag_parts.append(f"`{tags['hdr']}`")
+            if tags.get("audio"):
+                tag_parts.append(f"`{tags['audio']}`")
+            if tags.get("source"):
+                tag_parts.append(f"`{tags['source']}`")
+
+            tag_line = " ".join(tag_parts) if tag_parts else ""
+
+            # 主信息: 两列布局
+            left_md = f"**{idx}. {tname[:50]}**{'...' if len(tname) > 50 else ''}\n{tag_line}"
+            right_md = f"📡 {site}\n💾 {size}  |  🌱 {seeders}"
+
+            col = cls._column_set([
+                cls._column([cls._md(left_md)], weight=3),
+                cls._column([cls._md(right_md)], weight=2),
+            ])
+            elements.append(col)
+
+            # 下载按钮
+            elements.append(cls._action([
+                cls._button(f"⬇️ 下载 #{idx}", {"action": "download_resource", "index": item.get("index", 0)}, "primary"),
+            ]))
+
+            if idx < len(results):
+                elements.append(cls._hr())
+
+        return cls.wrap("📦 资源列表", elements, template="green")
+
+    @classmethod
+    def download_confirm_card(cls, index: int, title: str, site: str, size: str, tags: dict) -> dict:
+        """下载确认卡片"""
+        tag_parts = []
+        for k in ("resolution", "video_codec", "hdr", "audio", "source"):
+            if tags.get(k):
+                tag_parts.append(f"`{tags[k]}`")
+        tag_line = " ".join(tag_parts) if tag_parts else "无标签信息"
+
+        elements = [
+            cls._md(f"**{title}**\n\n📡 站点: {site}  |  💾 大小: {size}\n🏷 标签: {tag_line}"),
+            cls._hr(),
+            cls._md("⚠️ **确认下载此资源？**"),
+            cls._action([
+                cls._button("✅ 确认下载", {"action": "download_resource_confirm", "index": index}, "primary"),
+                cls._button("❌ 取消", {"action": "noop"}, "danger"),
+            ]),
+        ]
+        return cls.wrap("⬇️ 下载确认", elements, template="orange")
+
+    @classmethod
+    def downloading_card(cls, tasks: list, total: int = 0) -> dict:
+        """下载进度卡片 — 进度条可视化"""
+        if not tasks:
+            return cls.wrap("⬇️ 下载任务", [cls._md("当前没有正在下载的任务")], template="grey")
+
+        elements = [cls._md(f"共 **{total}** 个下载任务：\n")]
+
+        for t in tasks:
+            title = t.get("title", "未知")
+            progress = t.get("progress", 0)
+            bar_filled = int(progress / 10)
+            bar_empty = 10 - bar_filled
+            bar = "█" * bar_filled + "░" * bar_empty
+            elements.append(cls._md(f"**{title}**\n`{bar}` {progress}%"))
+
+        return cls.wrap("⬇️ 下载任务", elements, template="turquoise")
+
+    @classmethod
+    def status_card(cls, info: dict) -> dict:
+        """诊断状态卡片 — 结构化仪表板"""
+        elements = [
+            cls._column_set([
+                cls._column([cls._md(
+                    f"**版本** {info.get('version', '?')}\n"
+                    f"**实例** {info.get('instance', '?')}\n"
+                    f"**运行** {info.get('uptime', '?')}"
+                )], weight=1),
+                cls._column([cls._md(
+                    f"**飞书 Token** {info.get('feishu_token', '❌')}\n"
+                    f"**WebSocket** {info.get('ws_status', '❌')}\n"
+                    f"**lark-oapi** {info.get('lark_sdk', '❌')}"
+                )], weight=1),
+                cls._column([cls._md(
+                    f"**Agent** {info.get('agent_status', '❌')}\n"
+                    f"**模型** {info.get('model', '?')}\n"
+                    f"**对话数** {info.get('conversations', 0)}"
+                )], weight=1),
+            ]),
+            cls._hr(),
+            cls._md(
+                f"📊 消息 **{info.get('msg_count', 0)}**  |  "
+                f"Agent **{info.get('agent_count', 0)}**  |  "
+                f"传统 **{info.get('legacy_count', 0)}**  |  "
+                f"恢复 **{info.get('recover_count', 0)}**  |  "
+                f"缓存 🔍{info.get('cache_media', 0)} 📦{info.get('cache_res', 0)}"
+            ),
+            cls._hr(),
+            cls._md("💡 `/clear` 清除对话  |  `/status` 查看状态  |  `/help` 帮助"),
+        ]
+        return cls.wrap("🔧 插件诊断", elements, template="grey")
+
+    @classmethod
+    def help_card(cls, agent_on: bool, ws_on: bool) -> dict:
+        """帮助卡片"""
+        agent_str = "✅ 已启用" if agent_on else "❌ 未启用"
+        ws_str = "✅ WebSocket" if ws_on else "📡 HTTP 回调"
+
+        elements = [
+            cls._column_set([
+                cls._column([cls._md(f"🤖 AI Agent: **{agent_str}**")], weight=1),
+                cls._column([cls._md(f"📡 消息通道: **{ws_str}**")], weight=1),
+            ]),
+            cls._hr(),
+        ]
+
+        if agent_on:
+            elements.append(cls._md(
+                "**AI 模式** — 直接用自然语言对话即可\n\n"
+                "💬 `帮我搜一下流浪地球` → 搜索影视\n"
+                "💬 `下载第1个 4K版本` → 搜资源并下载\n"
+                "💬 `订阅进击的巨人` → 自动追更\n"
+                "💬 `下载进度` → 查看当前任务"
+            ))
+        else:
+            elements.append(cls._md(
+                "**传统指令模式**\n\n"
+                "🔍 `/搜索 <片名>` — 搜索影视\n"
+                "📥 `/订阅 <片名>` — 订阅追更\n"
+                "⬇️ `/正在下载` — 下载进度\n"
+                "❓ `/帮助` — 显示此帮助"
+            ))
+
+        elements.extend([
+            cls._hr(),
+            cls._md("🗑 `/clear` 清除对话  |  🔧 `/status` 运行状态"),
+        ])
+        return cls.wrap("📖 飞书机器人帮助", elements, template="violet")
+
+    @classmethod
+    def error_card(cls, error_msg: str) -> dict:
+        """错误提示卡片"""
+        elements = [cls._md(f"⚠️ {error_msg}")]
+        return cls.wrap("⚠️ 出错了", elements, template="red")
+
+    @classmethod
+    def notify_card(cls, title: str, content: str, template: str = "blue") -> dict:
+        """通用通知卡片 (入库/下载/订阅事件)"""
+        elements = [cls._md(content)]
+        return cls.wrap(title, elements, template=template)
+
+    @classmethod
+    def interrupted_card(cls, merged_text: str) -> dict:
+        """打断提示卡片"""
+        elements = [
+            cls._md(f"**新消息已收到** ➜ {merged_text[:60]}{'...' if len(merged_text) > 60 else ''}"),
+            cls._hr(),
+            cls._md("🔄 **已打断上一轮处理，正在响应最新消息...**"),
+        ]
+        return cls.wrap("🤖 MoviePilot AI", elements, template="indigo")
 
 
 # ╔════════════════════════════════════════════════════════════════════╗
@@ -441,23 +821,6 @@ _AGENT_TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_message",
-            "description": (
-                "向用户发送一条中间状态消息（如「正在搜索...」）。"
-                "Agent 最终回复会自动发送，不需要用这个工具发最终结果。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要发送的消息内容"}
-                },
-                "required": ["text"],
-            },
-        },
-    },
 ]
 
 
@@ -474,17 +837,19 @@ _AGENT_SYSTEM_PROMPT = """\
 3. **download_resource** — 下载指定资源（两步确认：先预览再下载）
 4. **subscribe_media** — 订阅影视（自动追更下载）
 5. **get_downloading** — 查看当前下载进度
-6. **send_message** — 发送中间状态提示
 
 ## 核心工作流程
 
 ### 搜索
-用户发来片名 → 调用 search_media → 展示结果摘要（编号+标题+年份+类型+评分）
+用户发来片名 → 调用 search_media → 用结构化格式展示：
+- 编号 + 标题 + 年份 + 类型 + 评分
+- 每个结果附简短简介
 
 ### 下载（最重要，必须严格遵守）
 1. 用户想下载 → 调用 search_resources 获取资源列表
 2. 分析返回的 tags，根据用户偏好筛选排序
-3. 推荐 1-3 个最佳资源，说明推荐理由
+3. 推荐 1-3 个最佳资源，用表格对比：
+   - 序号 | 标题 | 站点 | 大小 | 标签
 4. 调用 download_resource(index=X, confirmed=false) 获取待下载资源详情
 5. **展示详情并明确询问用户是否确认下载**
 6. 用户确认后 → 调用 download_resource(index=X, confirmed=true) 执行下载
@@ -503,9 +868,12 @@ _AGENT_SYSTEM_PROMPT = """\
 
 ## 回复风格
 - 简洁友好，使用中文
-- 用 emoji 适当点缀
+- 使用 markdown 格式组织信息（**加粗**标题，`代码框`标签，> 引用说明）
 - 展示列表时用编号，突出关键信息
-- 闲聊直接回复，不调用工具"""
+- 搜索结果按"编号. 标题 (年份) [类型] ⭐评分"格式
+- 资源对比时用简洁表格
+- 闲聊直接回复，不调用工具
+- 操作成功/失败时用对应 emoji 明确标识"""
 
 
 # ╔════════════════════════════════════════════════════════════════════╗
@@ -548,7 +916,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "4.0.1"
+    plugin_version = "5.0.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -564,7 +932,7 @@ class FeishuBot(_PluginBase):
     _llm_enabled: bool = False
     _openrouter_key: str = ""
     _openrouter_model: str = ""
-    _use_ws: bool = True  # 新增: 是否使用 WebSocket 长连接
+    _use_ws: bool = True
 
     # ── 运行时 ──
     _feishu: Optional[_FeishuAPI] = None
@@ -572,14 +940,20 @@ class FeishuBot(_PluginBase):
     _conversations: Optional[_ConversationManager] = None
     _search_cache: Optional[dict] = None
     _resource_cache: Optional[dict] = None
-    _user_locks: Optional[dict] = None
+
+    # ── 用户并发控制 (v5.0.0 重构) ──
+    _user_locks: Optional[dict] = None          # user_id -> Lock
+    _user_pending_msg: Optional[dict] = None    # user_id -> latest pending text
+    _user_interrupted: Optional[dict] = None    # user_id -> bool (是否被打断)
+    _user_processing: Optional[dict] = None     # user_id -> bool (是否正在处理)
 
     # ── WebSocket 长连接运行时 ──
-    _ws_client: Optional[Any] = None        # lark_oapi.ws.Client 实例
+    _ws_client: Optional[Any] = None
     _ws_thread: Optional[threading.Thread] = None
     _ws_running: bool = False
 
     _MAX_AGENT_ITERATIONS = 10
+    _MSG_MERGE_DELAY = 1.5  # 消息合并等待窗口（秒）
 
     # ══════════════════════════════════════════════════════════════════════
     #  生命周期
@@ -600,7 +974,7 @@ class FeishuBot(_PluginBase):
             # WebSocket 长连接开关（默认开启）
             ws_raw = config.get("use_ws")
             if ws_raw is None:
-                self._use_ws = True  # 默认开启
+                self._use_ws = True
             elif isinstance(ws_raw, bool):
                 self._use_ws = ws_raw
             elif isinstance(ws_raw, str):
@@ -623,15 +997,18 @@ class FeishuBot(_PluginBase):
         self._search_cache = {}
         self._resource_cache = {}
         self._user_locks = {}
+        self._user_pending_msg = {}
+        self._user_interrupted = {}
+        self._user_processing = {}
         self._llm_client = None
         self._conversations = None
-        self._init_ts = datetime.now()  # 插件初始化时间戳
-        self._feishu_ok = False  # 飞书连通状态
-        self._msg_count = 0  # 消息计数
-        self._agent_count = 0  # Agent 调用计数
-        self._legacy_count = 0  # 传统模式调用计数
-        self._recover_count = 0  # 运行时恢复次数
-        self._ws_connected = False  # WebSocket 连接状态
+        self._init_ts = datetime.now()
+        self._feishu_ok = False
+        self._msg_count = 0
+        self._agent_count = 0
+        self._legacy_count = 0
+        self._recover_count = 0
+        self._ws_connected = False
 
         # 验证飞书 Token 连通性
         if self._app_id and self._app_secret:
@@ -698,7 +1075,6 @@ class FeishuBot(_PluginBase):
             f"recovers={getattr(self, '_recover_count', '?')}"
         )
 
-        # ── 停止 WebSocket 长连接 ──
         self._stop_ws_client()
 
         self._llm_client = None
@@ -707,9 +1083,12 @@ class FeishuBot(_PluginBase):
         self._search_cache = None
         self._resource_cache = None
         self._user_locks = None
+        self._user_pending_msg = None
+        self._user_interrupted = None
+        self._user_processing = None
 
     # ══════════════════════════════════════════════════════════════════════
-    #  WebSocket 长连接管理 (v4.0.0 新增, v4.0.1 修复)
+    #  WebSocket 长连接管理
     # ══════════════════════════════════════════════════════════════════════
 
     def _start_ws_client(self):
@@ -727,10 +1106,7 @@ class FeishuBot(_PluginBase):
             return
 
         try:
-            # 构建事件处理器
             event_handler = self._build_event_handler()
-
-            # 创建 lark-oapi WebSocket 客户端
             self._ws_client = LarkWSClient(
                 self._app_id,
                 self._app_secret,
@@ -738,7 +1114,6 @@ class FeishuBot(_PluginBase):
                 log_level=lark.LogLevel.INFO,
             )
 
-            # 在后台线程中启动（ws.Client.start() 是阻塞的）
             self._ws_running = True
             self._ws_thread = threading.Thread(
                 target=self._ws_run_loop,
@@ -762,21 +1137,15 @@ class FeishuBot(_PluginBase):
         while self._ws_running:
             new_loop = None
             try:
-                # ── 关键修复: 为当前线程创建全新的 event loop ──
-                # MoviePilot (FastAPI/Uvicorn) 主线程已有 event loop，
-                # lark-oapi SDK 内部 start() 调用 loop.run_until_complete()，
-                # 如果复用主线程 loop 会报 "This event loop is already running"。
-                # 解决方案: 在后台线程创建独立 loop 并替换 SDK 模块级变量。
                 new_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(new_loop)
 
-                # 替换 lark-oapi SDK 内部使用的模块级 event loop
                 import lark_oapi.ws.client as _ws_mod
                 _ws_mod.loop = new_loop
 
                 logger.info("飞书 WebSocket 长连接线程启动")
                 self._ws_connected = True
-                self._ws_client.start()  # 阻塞，直到连接断开
+                self._ws_client.start()
             except Exception as e:
                 logger.error(f"飞书 WebSocket 长连接异常退出: {e}", exc_info=True)
             finally:
@@ -788,11 +1157,9 @@ class FeishuBot(_PluginBase):
                         pass
 
             if self._ws_running:
-                import time
                 logger.warning("飞书 WebSocket 长连接断开，10 秒后尝试重连...")
-                time.sleep(10)
+                _time.sleep(10)
 
-                # 重新创建客户端实例
                 try:
                     event_handler = self._build_event_handler()
                     self._ws_client = LarkWSClient(
@@ -803,36 +1170,26 @@ class FeishuBot(_PluginBase):
                     )
                 except Exception as e:
                     logger.error(f"WebSocket 客户端重建失败: {e}", exc_info=True)
-                    import time
-                    time.sleep(30)
+                    _time.sleep(30)
 
         logger.info("飞书 WebSocket 长连接线程已退出")
 
     def _build_event_handler(self) -> "EventDispatcherHandler":
         """构建 lark-oapi 事件分发处理器"""
-        # 创建闭包引用 self
         plugin = self
 
         def on_message_receive(data):
-            """处理接收到的消息事件 (im.message.receive_v1)"""
             try:
                 logger.info(
                     f"[WS] 收到消息事件 v{plugin.plugin_version}, "
                     f"inst={id(plugin):#x}"
                 )
-
-                # 从 lark-oapi 事件对象中提取数据
                 event_data = _json.loads(lark.JSON.marshal(data))
                 event = event_data.get("event", {})
-
                 if not event:
                     logger.warning("[WS] 消息事件缺少 event 字段")
                     return
-
-                # 确保运行时对象可用
                 plugin._ensure_runtime_ready()
-
-                # 启动后台线程处理消息
                 threading.Thread(
                     target=plugin._handle_message,
                     args=(event,),
@@ -841,7 +1198,6 @@ class FeishuBot(_PluginBase):
             except Exception as e:
                 logger.error(f"[WS] 消息事件处理异常: {e}", exc_info=True)
 
-        # 使用 EventDispatcherHandler 构建器注册事件
         handler = EventDispatcherHandler.builder("", "") \
             .register_p2_im_message_receive_v1(on_message_receive) \
             .build()
@@ -855,8 +1211,6 @@ class FeishuBot(_PluginBase):
 
         if self._ws_client is not None:
             try:
-                # lark-oapi ws.Client 没有公开的 stop 方法，
-                # 设置 _ws_running=False 后线程退出循环即可
                 logger.info("正在停止飞书 WebSocket 长连接...")
             except Exception as e:
                 logger.error(f"停止 WebSocket 异常: {e}")
@@ -875,14 +1229,7 @@ class FeishuBot(_PluginBase):
     # ══════════════════════════════════════════════════════════════════════
 
     def _ensure_runtime_ready(self):
-        """
-        惰性恢复运行时对象。
-
-        防御场景:
-        - get_api() 绑定了旧实例，而新实例的 stop_service 又被调用
-        - MoviePilot 生命周期管理导致运行时对象意外丢失
-        - 插件重载时 stop_service 被调用但 API 端点仍指向旧实例
-        """
+        """惰性恢复运行时对象"""
         recovered = []
 
         if self._feishu is None and self._app_id:
@@ -895,6 +1242,12 @@ class FeishuBot(_PluginBase):
             self._resource_cache = {}
         if self._user_locks is None:
             self._user_locks = {}
+        if self._user_pending_msg is None:
+            self._user_pending_msg = {}
+        if self._user_interrupted is None:
+            self._user_interrupted = {}
+        if self._user_processing is None:
+            self._user_processing = {}
 
         if self._llm_enabled and self._openrouter_key:
             if self._llm_client is None:
@@ -922,7 +1275,7 @@ class FeishuBot(_PluginBase):
             )
 
     # ══════════════════════════════════════════════════════════════════════
-    #  API 端点（HTTP 回调 — 保留作为备用 / 向下兼容）
+    #  API 端点（HTTP 回调备用）
     # ══════════════════════════════════════════════════════════════════════
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -947,7 +1300,6 @@ class FeishuBot(_PluginBase):
                 logger.info("飞书 URL 验证请求")
                 return {"challenge": data.get("challenge", "")}
 
-            # 确保运行时对象可用（防御 stop_service 后仍有请求到达）
             self._ensure_runtime_ready()
 
             if data.get("type") == "card.action.trigger":
@@ -965,7 +1317,7 @@ class FeishuBot(_PluginBase):
             return {"code": -1, "msg": str(e)}
 
     # ══════════════════════════════════════════════════════════════════════
-    #  消息路由
+    #  消息路由 (v5.0.0 重构)
     # ══════════════════════════════════════════════════════════════════════
 
     def _handle_message(self, event: dict):
@@ -977,12 +1329,14 @@ class FeishuBot(_PluginBase):
         sender = event.get("sender", {}).get("sender_id", {})
         user_id = sender.get("open_id", "")
 
-        # 确保运行时对象可用（后台线程可能在 stop_service 后执行）
         self._ensure_runtime_ready()
 
         if msg_type != "text":
             if self._feishu:
-                self._feishu.send_text(chat_id, "暂时只支持文字消息哦~")
+                self._feishu.send_card(
+                    chat_id,
+                    _CardBuilder.error_card("暂时只支持文字消息哦~")
+                )
             return
 
         try:
@@ -990,7 +1344,7 @@ class FeishuBot(_PluginBase):
         except Exception:
             text = ""
 
-        # ── 清理飞书 @提及标记（群聊中会包含 @_user_1 等占位符）──
+        # ── 清理飞书 @提及标记 ──
         mentions = msg.get("mentions")
         if mentions:
             for m in mentions:
@@ -1026,20 +1380,28 @@ class FeishuBot(_PluginBase):
             if self._conversations:
                 self._conversations.clear(user_id)
             if self._feishu:
-                self._feishu.send_text(chat_id, "🗑️ 对话已清除")
+                self._feishu.send_card(
+                    chat_id,
+                    _CardBuilder.notify_card("🗑️ 对话已清除", "历史会话已重置，可以开始新的对话。", "green"),
+                    reply_msg_id=msg_id,
+                )
             return
 
-        # ── Agent 模式：一切交给 LLM ──
+        if text.startswith("/help") or text.startswith("/帮助"):
+            self._cmd_help(chat_id, msg_id)
+            return
+
+        # ── Agent 模式：消息队列 + 打断机制 ──
         if is_agent:
             try:
                 self._agent_count = getattr(self, "_agent_count", 0) + 1
             except Exception:
                 pass
             logger.info(f"[Agent] 路由到 Agent (#{self._agent_count}): {text[:80]}")
-            self._agent_handle(text, chat_id, msg_id, user_id)
+            self._agent_dispatch(text, chat_id, msg_id, user_id)
             return
 
-        # ── 传统模式：指令解析 ──
+        # ── 传统模式 ──
         try:
             self._legacy_count = getattr(self, "_legacy_count", 0) + 1
         except Exception:
@@ -1050,7 +1412,7 @@ class FeishuBot(_PluginBase):
         logger.error(f"_handle_message 顶层异常: {_exc}", exc_info=True)
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Agent 入口 + 循环
+    #  Agent 并发控制 (v5.0.0 新增 — 消息队列 + 打断机制)
     # ══════════════════════════════════════════════════════════════════════
 
     def _get_user_lock(self, user_id: str) -> threading.Lock:
@@ -1060,51 +1422,210 @@ class FeishuBot(_PluginBase):
             self._user_locks[user_id] = threading.Lock()
         return self._user_locks[user_id]
 
-    def _agent_handle(self, text: str, chat_id: str, msg_id: str, user_id: str):
-        """Agent 入口：构建上下文 → 循环 → 发送回复 → 保存历史"""
-        import time as _time
-        _t0 = _time.monotonic()
-        lock = self._get_user_lock(user_id)
-        if not lock.acquire(blocking=False):
-            self._feishu.send_text(chat_id, "⏳ 上一个请求还在处理中，请稍候...")
+    def _agent_dispatch(self, text: str, chat_id: str, msg_id: str, user_id: str):
+        """
+        Agent 消息调度器 — 解决用户连续发消息导致多轮并行回复的问题。
+
+        策略:
+        1. 如果该用户当前没有 Agent 在处理 → 等待短暂合并窗口后开始处理
+        2. 如果该用户当前有 Agent 在处理 → 标记"打断"，存储最新消息
+           当前轮次完成后会自动使用最新消息重新开始
+        """
+        if self._user_pending_msg is None:
+            self._user_pending_msg = {}
+        if self._user_interrupted is None:
+            self._user_interrupted = {}
+        if self._user_processing is None:
+            self._user_processing = {}
+
+        is_processing = self._user_processing.get(user_id, False)
+
+        if is_processing:
+            # ── 用户在 Agent 处理期间又发了新消息 → 标记打断 ──
+            self._user_pending_msg[user_id] = (text, chat_id, msg_id)
+            self._user_interrupted[user_id] = True
+            logger.info(f"[Agent] 用户 {user_id} 打断: 存储新消息 '{text[:40]}'")
+
+            # 给用户即时反馈
+            if self._feishu:
+                self._feishu.send_card(
+                    chat_id,
+                    _CardBuilder.interrupted_card(text),
+                    reply_msg_id=msg_id,
+                )
             return
+
+        # ── 没有正在处理的任务 → 等待合并窗口后启动 ──
+        self._user_pending_msg[user_id] = (text, chat_id, msg_id)
+        self._user_interrupted[user_id] = False
+
+        threading.Thread(
+            target=self._agent_merge_and_run,
+            args=(user_id,),
+            daemon=True,
+        ).start()
+
+    def _agent_merge_and_run(self, user_id: str):
+        """等待合并窗口 → 取最新消息 → 执行 Agent → 检查是否有新打断"""
+        # 短暂等待，让快速连续的消息可以合并
+        _time.sleep(self._MSG_MERGE_DELAY)
+
+        lock = self._get_user_lock(user_id)
+        if not lock.acquire(blocking=True, timeout=120):
+            logger.warning(f"[Agent] 用户 {user_id} 锁获取超时")
+            return
+
+        try:
+            while True:
+                # 取最新消息
+                pending = (self._user_pending_msg or {}).pop(user_id, None)
+                if not pending:
+                    break
+
+                text, chat_id, msg_id = pending
+                self._user_interrupted[user_id] = False
+                self._user_processing[user_id] = True
+
+                logger.info(f"[Agent] 开始处理: user={user_id}, text='{text[:60]}'")
+
+                # 执行 Agent
+                self._agent_handle(text, chat_id, msg_id, user_id)
+
+                self._user_processing[user_id] = False
+
+                # 检查是否被打断（有新消息等待）
+                if self._user_interrupted.get(user_id, False):
+                    logger.info(f"[Agent] 用户 {user_id} 被打断，处理新消息...")
+                    self._user_interrupted[user_id] = False
+                    # 继续 while 循环处理新消息
+                    continue
+                else:
+                    break
+        finally:
+            self._user_processing[user_id] = False
+            lock.release()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Agent 入口 + 循环
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _agent_handle(self, text: str, chat_id: str, msg_id: str, user_id: str):
+        """Agent 入口：即时反馈 → 构建上下文 → 循环 → 更新卡片 → 保存历史"""
+        _t0 = _time.monotonic()
+
+        # ── 即时反馈: 发送 "处理中" 卡片 ──
+        processing_card = _CardBuilder.processing_card(text)
+        send_result = self._feishu.send_card(chat_id, processing_card, reply_msg_id=msg_id)
+
+        # 提取发送的卡片 message_id，用于后续更新
+        status_msg_id = ""
+        try:
+            status_msg_id = send_result.get("data", {}).get("message_id", "")
+        except Exception:
+            pass
 
         try:
             # 获取对话历史副本并追加新消息
             messages = self._conversations.get(user_id)
             messages.append({"role": "user", "content": text})
 
-            # 执行 Agent 循环
-            updated, reply = self._agent_loop(messages, chat_id, user_id)
+            # 执行 Agent 循环（带进度回调）
+            step_log = []
 
-            # 发送回复
+            def on_tool_start(tool_name: str, tool_args: dict):
+                """工具开始执行时的回调 — 更新进度卡片"""
+                if self._user_interrupted.get(user_id, False):
+                    return  # 已被打断，不再更新
+                friendly = self._tool_friendly_name(tool_name, tool_args)
+                step_log.append(friendly)
+                if status_msg_id and self._feishu:
+                    try:
+                        progress_card = _CardBuilder.agent_tool_progress_card(
+                            text, step_log[:-1], step_log[-1]
+                        )
+                        self._feishu.update_card(status_msg_id, progress_card)
+                    except Exception:
+                        pass
+
+            def on_tool_done(tool_name: str, tool_args: dict):
+                """工具完成时的回调"""
+                pass  # step_log 已在 on_tool_start 中更新
+
+            updated, reply = self._agent_loop(
+                messages, chat_id, user_id,
+                on_tool_start=on_tool_start,
+                on_tool_done=on_tool_done,
+            )
+
+            # ── 检查是否被打断 ──
+            if self._user_interrupted.get(user_id, False):
+                logger.info(f"[Agent] 用户 {user_id} 处理被打断，放弃当前回复")
+                # 不保存对话、不发送回复（新消息会重新处理）
+                return
+
+            # ── 发送最终回复 ──
+            elapsed = _time.monotonic() - _t0
             if reply:
-                self._feishu.send_text(chat_id, reply, reply_msg_id=msg_id)
+                final_card = _CardBuilder.agent_reply_card(reply, elapsed)
+                if status_msg_id and self._feishu:
+                    self._feishu.update_card(status_msg_id, final_card)
+                else:
+                    self._feishu.send_card(chat_id, final_card, reply_msg_id=msg_id)
             else:
-                self._feishu.send_text(chat_id, "🔔 我没有想到回复，请再试试~")
+                error_card = _CardBuilder.error_card("AI 没有生成回复，请再试试~")
+                if status_msg_id and self._feishu:
+                    self._feishu.update_card(status_msg_id, error_card)
+                else:
+                    self._feishu.send_card(chat_id, error_card)
 
             # 成功后才保存
             self._conversations.save(user_id, updated)
 
         except Exception as e:
             logger.error(f"Agent 异常: {e}", exc_info=True)
-            self._feishu.send_text(chat_id, f"⚠️ AI 处理出错: {e}")
+            error_card = _CardBuilder.error_card(f"AI 处理出错: {e}")
+            if status_msg_id and self._feishu:
+                self._feishu.update_card(status_msg_id, error_card)
+            elif self._feishu:
+                self._feishu.send_card(chat_id, error_card)
         finally:
             _elapsed = _time.monotonic() - _t0
             logger.info(f"[Agent] 处理完成: user={user_id}, elapsed={_elapsed:.1f}s")
-            lock.release()
+
+    @staticmethod
+    def _tool_friendly_name(tool_name: str, tool_args: dict) -> str:
+        """将工具名+参数转为用户友好的描述"""
+        names = {
+            "search_media": "搜索影视「{keyword}」",
+            "search_resources": "搜索资源「{keyword}」",
+            "download_resource": "下载资源 #{index}",
+            "subscribe_media": "订阅影视",
+            "get_downloading": "查询下载进度",
+        }
+        template = names.get(tool_name, tool_name)
+        try:
+            return template.format(**tool_args)
+        except (KeyError, IndexError):
+            return template.split("「")[0].strip()
 
     def _agent_loop(
-        self, messages: list, chat_id: str, user_id: str
+        self, messages: list, chat_id: str, user_id: str,
+        on_tool_start: Callable = None,
+        on_tool_done: Callable = None,
     ) -> Tuple[list, str]:
         """
         多轮 Tool Calling 循环。
-
         在消息副本上操作，返回 (更新后的消息列表, 最终回复文本)。
+        支持 on_tool_start / on_tool_done 回调用于进度更新。
         """
         working = list(messages)
 
         for iteration in range(self._MAX_AGENT_ITERATIONS):
+            # ── 打断检查 ──
+            if self._user_interrupted.get(user_id, False):
+                logger.info(f"[Agent] 循环被打断 (第{iteration+1}轮)")
+                return working, ""
+
             # ── 调用 LLM ──
             try:
                 result = self._llm_client.chat(
@@ -1155,7 +1676,14 @@ class FeishuBot(_PluginBase):
 
                 logger.info(f"Agent tool [{iteration+1}]: {fn_name}({fn_args})")
 
+                # 进度回调
+                if on_tool_start:
+                    on_tool_start(fn_name, fn_args)
+
                 tool_result = self._execute_tool(fn_name, fn_args, chat_id, user_id)
+
+                if on_tool_done:
+                    on_tool_done(fn_name, fn_args)
 
                 working.append({
                     "role": "tool",
@@ -1193,11 +1721,6 @@ class FeishuBot(_PluginBase):
                 )
             elif fn_name == "get_downloading":
                 return self._tool_get_downloading()
-            elif fn_name == "send_message":
-                text = fn_args.get("text", "")
-                if text:
-                    self._feishu.send_text(chat_id, text)
-                return {"sent": True}
             else:
                 return {"error": f"未知工具: {fn_name}"}
         except Exception as e:
@@ -1210,7 +1733,6 @@ class FeishuBot(_PluginBase):
         try:
             from app.chain.media import MediaChain
             result = MediaChain().search(title=keyword)
-            # 兼容不同 MoviePilot 版本的返回格式
             if isinstance(result, tuple) and len(result) == 2:
                 meta, medias = result
             elif isinstance(result, list):
@@ -1223,7 +1745,6 @@ class FeishuBot(_PluginBase):
 
             valid = []
             for i, m in enumerate(medias[:8]):
-                # 跳过字符串（str.title 是方法，会被误判为有 title 属性）
                 if isinstance(m, str) or not hasattr(m, "tmdb_id"):
                     continue
                 raw_type = getattr(m, "type", None)
@@ -1260,7 +1781,6 @@ class FeishuBot(_PluginBase):
                 if isinstance(result, tuple) and len(result) == 2:
                     _, medias = result
                     if medias and not isinstance(medias[0], str) and hasattr(medias[0], "tmdb_id"):
-                        # 安全取 title 属性（避免 str.title 方法引用）
                         raw_title = getattr(medias[0], "title", None)
                         if isinstance(raw_title, str) and raw_title:
                             title = raw_title
@@ -1398,7 +1918,7 @@ class FeishuBot(_PluginBase):
             return {"error": str(e)}
 
     # ══════════════════════════════════════════════════════════════════════
-    #  传统模式指令
+    #  传统模式指令 (v5.0.0: 使用卡片输出)
     # ══════════════════════════════════════════════════════════════════════
 
     def _legacy_handle(self, text: str, chat_id: str, msg_id: str, user_id: str):
@@ -1418,44 +1938,50 @@ class FeishuBot(_PluginBase):
     def _legacy_search(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
         if not keyword:
             return
-        self._feishu.send_text(chat_id, f"🔍 正在搜索: {keyword} ...")
+        # 即时反馈
+        self._feishu.send_card(
+            chat_id,
+            _CardBuilder.notify_card("🔍 搜索中...", f"正在搜索「{keyword}」，请稍候...", "indigo"),
+        )
         result = self._tool_search_media(keyword, user_id)
         if result.get("error"):
-            self._feishu.send_text(chat_id, f"⚠️ {result['error']}")
+            self._feishu.send_card(chat_id, _CardBuilder.error_card(result['error']))
             return
         items = result.get("results", [])
         if not items:
-            self._feishu.send_text(chat_id, result.get("message", f"😔 未找到: {keyword}"))
+            self._feishu.send_card(
+                chat_id,
+                _CardBuilder.notify_card("🔍 搜索结果", result.get("message", f"未找到: {keyword}"), "grey"),
+            )
             return
-        lines = []
-        for item in items:
-            line = f"{item['index']+1}. {item['title']} ({item['year']}) [{item['type']}]"
-            if item.get("rating"):
-                line += f" ⭐{item['rating']}"
-            lines.append(line)
-        lines.append("\n回复「/订阅 片名」订阅 | 回复片名搜索资源")
-        self._feishu.send_text(chat_id, "\n".join(lines))
+        # 使用搜索结果卡片
+        self._feishu.send_card(chat_id, _CardBuilder.search_result_card(keyword, items))
 
     def _legacy_subscribe(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
         if not keyword:
             return
-        self._feishu.send_text(chat_id, f"📥 正在订阅: {keyword} ...")
+        self._feishu.send_card(
+            chat_id,
+            _CardBuilder.notify_card("📥 订阅中...", f"正在订阅「{keyword}」...", "indigo"),
+        )
         result = self._tool_subscribe_media(None, keyword, user_id)
         msg = result.get("message") or result.get("error", "操作失败")
-        icon = "✅" if result.get("success") else "⚠️"
-        self._feishu.send_text(chat_id, f"{icon} {msg}")
+        if result.get("success"):
+            self._feishu.send_card(
+                chat_id,
+                _CardBuilder.notify_card("✅ 订阅成功", msg, "green"),
+            )
+        else:
+            self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
 
     def _legacy_downloading(self, chat_id: str, msg_id: str):
         result = self._tool_get_downloading()
         tasks = result.get("tasks", [])
-        if not tasks:
-            self._feishu.send_text(chat_id, "当前没有正在下载的任务")
-            return
-        lines = [f"{i+1}. {t['title']}  进度: {t['progress']}%" for i, t in enumerate(tasks)]
-        self._feishu.send_text(chat_id, "\n".join(lines))
+        total = result.get("total", len(tasks))
+        self._feishu.send_card(chat_id, _CardBuilder.downloading_card(tasks, total))
 
     # ══════════════════════════════════════════════════════════════════════
-    #  诊断 / 帮助
+    #  诊断 / 帮助 (v5.0.0: 卡片化)
     # ══════════════════════════════════════════════════════════════════════
 
     def _cmd_status(self, chat_id: str, msg_id: str):
@@ -1463,12 +1989,13 @@ class FeishuBot(_PluginBase):
         conv = self._conversations.active_users if self._conversations else 0
         cache_media = len(self._search_cache) if self._search_cache else 0
         cache_res = len(self._resource_cache) if self._resource_cache else 0
-        uptime = ""
+
+        uptime = "未知"
         if hasattr(self, "_init_ts") and self._init_ts:
             delta = datetime.now() - self._init_ts
             hours, remainder = divmod(int(delta.total_seconds()), 3600)
             mins, secs = divmod(remainder, 60)
-            uptime = f"{hours}h{mins}m{secs}s"
+            uptime = f"{hours}h {mins}m {secs}s"
 
         ws_status = "❌ 未启用"
         if self._use_ws:
@@ -1477,57 +2004,50 @@ class FeishuBot(_PluginBase):
             elif self._ws_connected:
                 ws_status = "✅ 已连接"
             elif self._ws_running:
-                ws_status = "🔄 连接中..."
+                ws_status = "🔄 连接中"
             else:
                 ws_status = "❌ 未运行"
 
-        self._feishu.send_text(
+        agent_status = "❌ 未激活"
+        if self._llm_client:
+            agent_status = "✅ 运行中"
+        elif self._llm_enabled:
+            agent_status = "⚠️ 已启用未激活"
+
+        info = {
+            "version": self.plugin_version,
+            "instance": f"{id(self):#x}",
+            "uptime": uptime,
+            "feishu_token": "✅ 正常" if getattr(self, "_feishu_ok", False) else "❌ 异常",
+            "ws_status": ws_status,
+            "lark_sdk": "✅ 已安装" if _HAS_LARK_SDK else "❌ 未安装",
+            "agent_status": agent_status,
+            "model": model,
+            "conversations": conv,
+            "msg_count": getattr(self, "_msg_count", 0),
+            "agent_count": getattr(self, "_agent_count", 0),
+            "legacy_count": getattr(self, "_legacy_count", 0),
+            "recover_count": getattr(self, "_recover_count", 0),
+            "cache_media": cache_media,
+            "cache_res": cache_res,
+        }
+        self._feishu.send_card(
             chat_id,
-            f"🔧 插件诊断 v{self.plugin_version}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 基础状态\n"
-            f"  实例: {id(self):#x}\n"
-            f"  启用: {self._enabled}\n"
-            f"  运行时间: {uptime}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📡 飞书连接\n"
-            f"  Token: {'✅ 正常' if getattr(self, '_feishu_ok', False) else '❌ 异常'}\n"
-            f"  API 对象: {'✅' if self._feishu else '❌'}\n"
-            f"  WebSocket: {ws_status}\n"
-            f"  lark-oapi: {'✅ 已安装' if _HAS_LARK_SDK else '❌ 未安装'}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🤖 AI Agent\n"
-            f"  状态: {'✅ 已激活' if self._llm_client else '❌ 未激活'}\n"
-            f"  llm_enabled: {self._llm_enabled}\n"
-            f"  api_key: {'已配置' if self._openrouter_key else '未配置'}\n"
-            f"  模型: {model}\n"
-            f"  对话数: {conv}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 统计\n"
-            f"  消息总数: {getattr(self, '_msg_count', 0)}\n"
-            f"  Agent 调用: {getattr(self, '_agent_count', 0)}\n"
-            f"  传统指令: {getattr(self, '_legacy_count', 0)}\n"
-            f"  运行时恢复: {getattr(self, '_recover_count', 0)}\n"
-            f"  搜索缓存: {cache_media} | 资源缓存: {cache_res}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"指令: /clear 清除对话 | /status 查看状态",
+            _CardBuilder.status_card(info),
+            reply_msg_id=msg_id,
         )
 
     def _cmd_help(self, chat_id: str, msg_id: str):
-        agent_on = "✅ 已启用" if self._llm_client else "❌ 未启用"
-        ws_on = "✅ WebSocket" if (self._use_ws and self._ws_running) else "📡 HTTP 回调"
-        self._feishu.send_text(
+        agent_on = self._llm_client is not None
+        ws_on = self._use_ws and self._ws_running
+        self._feishu.send_card(
             chat_id,
-            f"📖 飞书机器人帮助\n\n"
-            f"AI Agent: {agent_on}\n"
-            f"消息通道: {ws_on}\n\n"
-            f"开启 AI 后直接用自然语言对话即可。\n"
-            f"传统指令：\n"
-            f"/搜索 <片名> | /订阅 <片名> | /正在下载 | /帮助",
+            _CardBuilder.help_card(agent_on, ws_on),
+            reply_msg_id=msg_id,
         )
 
     # ══════════════════════════════════════════════════════════════════════
-    #  卡片回调
+    #  卡片回调 (v5.0.0: 支持新卡片按钮)
     # ══════════════════════════════════════════════════════════════════════
 
     def _handle_card_action(self, data: dict) -> dict:
@@ -1545,26 +2065,80 @@ class FeishuBot(_PluginBase):
                 threading.Thread(
                     target=self._card_download, args=(idx, user_id, chat_id), daemon=True,
                 ).start()
+            elif act == "download_resource_confirm":
+                idx = int(value.get("index", 0))
+                threading.Thread(
+                    target=self._card_download_confirmed, args=(idx, user_id, chat_id), daemon=True,
+                ).start()
             elif act == "subscribe":
                 idx = int(value.get("index", 0))
                 threading.Thread(
                     target=self._card_subscribe, args=(idx, user_id, chat_id), daemon=True,
                 ).start()
+            elif act == "search_resources_by_title":
+                kw = value.get("keyword", "")
+                threading.Thread(
+                    target=self._card_search_resources, args=(kw, user_id, chat_id), daemon=True,
+                ).start()
+            elif act == "noop":
+                pass
         except Exception as e:
             logger.error(f"卡片回调异常: {e}", exc_info=True)
         return {"code": 0}
 
     def _card_download(self, idx: int, user_id: str, chat_id: str):
+        """卡片按钮: 展示下载确认"""
+        result = self._tool_download_resource(idx, confirmed=False, user_id=user_id)
+        if result.get("error"):
+            self._feishu.send_card(chat_id, _CardBuilder.error_card(result["error"]))
+            return
+        self._feishu.send_card(
+            chat_id,
+            _CardBuilder.download_confirm_card(
+                idx,
+                result.get("title", "未知"),
+                result.get("site", "未知"),
+                result.get("size", "未知"),
+                result.get("tags", {}),
+            ),
+        )
+
+    def _card_download_confirmed(self, idx: int, user_id: str, chat_id: str):
+        """卡片按钮: 确认下载"""
         result = self._tool_download_resource(idx, confirmed=True, user_id=user_id)
         msg = result.get("message") or result.get("error", "操作失败")
-        icon = "✅" if result.get("success") else "⚠️"
-        self._feishu.send_text(chat_id, f"{icon} {msg}")
+        if result.get("success"):
+            self._feishu.send_card(
+                chat_id,
+                _CardBuilder.notify_card("✅ 下载已添加", msg, "green"),
+            )
+        else:
+            self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
 
     def _card_subscribe(self, idx: int, user_id: str, chat_id: str):
         result = self._tool_subscribe_media(idx, None, user_id)
         msg = result.get("message") or result.get("error", "操作失败")
-        icon = "✅" if result.get("success") else "⚠️"
-        self._feishu.send_text(chat_id, f"{icon} {msg}")
+        if result.get("success"):
+            self._feishu.send_card(
+                chat_id,
+                _CardBuilder.notify_card("✅ 订阅成功", msg, "green"),
+            )
+        else:
+            self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
+
+    def _card_search_resources(self, keyword: str, user_id: str, chat_id: str):
+        """卡片按钮: 搜索资源"""
+        self._feishu.send_card(
+            chat_id,
+            _CardBuilder.notify_card("📦 搜索资源中...", f"正在搜索「{keyword}」的下载资源...", "indigo"),
+        )
+        result = self._tool_search_resources(keyword, user_id)
+        if result.get("error"):
+            self._feishu.send_card(chat_id, _CardBuilder.error_card(result["error"]))
+            return
+        items = result.get("results", [])
+        title = result.get("title", keyword)
+        self._feishu.send_card(chat_id, _CardBuilder.resource_result_card(keyword, title, items))
 
     # ══════════════════════════════════════════════════════════════════════
     #  表单配置
@@ -1663,7 +2237,6 @@ class FeishuBot(_PluginBase):
     def get_page(self) -> List[dict]:
         """插件详情页 — 运行时状态（仅使用 MoviePilot 已知支持的组件）"""
         try:
-            # 运行时间
             uptime = "未知"
             if hasattr(self, "_init_ts") and self._init_ts:
                 delta = datetime.now() - self._init_ts
@@ -1679,7 +2252,6 @@ class FeishuBot(_PluginBase):
             except Exception:
                 pass
 
-            # WebSocket 状态
             ws_status = "未启用"
             if self._use_ws:
                 if not _HAS_LARK_SDK:
@@ -1691,7 +2263,6 @@ class FeishuBot(_PluginBase):
                 else:
                     ws_status = "❌ 未运行"
 
-            # 构建状态文本
             lines = [
                 f"📌 插件 v{self.plugin_version}  |  实例 {id(self):#x}  |  运行 {uptime}",
                 "",
@@ -1737,7 +2308,7 @@ class FeishuBot(_PluginBase):
             return []
 
     # ══════════════════════════════════════════════════════════════════════
-    #  事件通知
+    #  事件通知 (v5.0.0: 卡片化)
     # ══════════════════════════════════════════════════════════════════════
 
     @eventmanager.register(EventType.TransferComplete)
@@ -1749,7 +2320,11 @@ class FeishuBot(_PluginBase):
             return
         title = getattr(mi, "title", "")
         year = getattr(mi, "year", "")
-        self._feishu.send_text(self._chat_id, f"🎬 入库完成: {title}" + (f" ({year})" if year else ""))
+        text = f"**{title}**" + (f" ({year})" if year else "") + " 已入库完成"
+        self._feishu.send_card(
+            self._chat_id,
+            _CardBuilder.notify_card("🎬 入库完成", text, "green"),
+        )
 
     @eventmanager.register(EventType.DownloadAdded)
     def _on_download(self, event: Event):
@@ -1757,11 +2332,17 @@ class FeishuBot(_PluginBase):
             return
         mi = (event.event_data or {}).get("mediainfo")
         title = getattr(mi, "title", "未知") if mi else "未知"
-        self._feishu.send_text(self._chat_id, f"⬇️ 开始下载: {title}")
+        self._feishu.send_card(
+            self._chat_id,
+            _CardBuilder.notify_card("⬇️ 开始下载", f"**{title}** 已添加到下载队列", "blue"),
+        )
 
     @eventmanager.register(EventType.SubscribeAdded)
     def _on_subscribe(self, event: Event):
         if not self._enabled or "subscribe" not in self._msgtypes or not self._chat_id:
             return
         title = (event.event_data or {}).get("title") or (event.event_data or {}).get("name") or "未知"
-        self._feishu.send_text(self._chat_id, f"📌 新增订阅: {title}")
+        self._feishu.send_card(
+            self._chat_id,
+            _CardBuilder.notify_card("📌 新增订阅", f"**{title}** 已加入订阅列表", "violet"),
+        )
