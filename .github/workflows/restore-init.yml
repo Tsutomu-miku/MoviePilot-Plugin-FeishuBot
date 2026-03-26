@@ -2,8 +2,7 @@ name: Restore __init__.py
 
 on:
   push:
-    paths:
-      - '.github/workflows/restore-init.yml'
+    branches: [main]
 
 permissions:
   contents: write
@@ -16,27 +15,39 @@ jobs:
 
       - name: Download and restore file
         run: |
-          curl -L -o plugins.v2/feishubot/__init__.py "https://p-mira-img-sign-sgnontt.byteintl.net/tos-mya-i-xobrcjvdq7/67e84dd90f744662a8bd3a7b4f87a773.py~tplv-xobrcjvdq7-image.image?lk3s=3523e930&x-orig-authkey=miraorigin&x-orig-expires=1775127600&x-orig-sign=VGiTB1EaoxbE3JursDQpJC7g9vw%3D"
-          echo "File size: $(wc -c < plugins.v2/feishubot/__init__.py)"
-          echo "MD5: $(md5sum plugins.v2/feishubot/__init__.py | cut -d' ' -f1)"
-          EXPECTED_MD5="e0f7aa1a7bc340744f2ae09103a7b205"
-          ACTUAL_MD5=$(md5sum plugins.v2/feishubot/__init__.py | cut -d' ' -f1)
-          if [ "$ACTUAL_MD5" != "$EXPECTED_MD5" ]; then
-            echo "ERROR: MD5 mismatch! Expected $EXPECTED_MD5, got $ACTUAL_MD5"
+          curl -sL -o plugins.v2/feishubot/__init__.py "https://p-mira-img-sign-sgnontt.byteintl.net/tos-mya-i-xobrcjvdq7/67e84dd90f744662a8bd3a7b4f87a773.py~tplv-xobrcjvdq7-image.image?lk3s=3523e930&x-orig-authkey=miraorigin&x-orig-expires=1775127600&x-orig-sign=VGiTB1EaoxbE3JursDQpJC7g9vw%3D"
+          FILE_SIZE=$(wc -c < plugins.v2/feishubot/__init__.py)
+          echo "File size: $FILE_SIZE"
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "ERROR: Downloaded file too small ($FILE_SIZE bytes), aborting"
             exit 1
           fi
-          echo "MD5 verified successfully!"
+          EXPECTED_MD5="e0f7aa1a7bc340744f2ae09103a7b205"
+          ACTUAL_MD5=$(md5sum plugins.v2/feishubot/__init__.py | cut -d' ' -f1)
+          echo "Expected MD5: $EXPECTED_MD5"
+          echo "Actual MD5:   $ACTUAL_MD5"
+          if [ "$ACTUAL_MD5" != "$EXPECTED_MD5" ]; then
+            echo "ERROR: MD5 mismatch!"
+            exit 1
+          fi
+          echo "MD5 verified OK!"
 
-      - name: Commit and push
+      - name: Commit and push restored file
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add plugins.v2/feishubot/__init__.py
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git diff --cached --quiet && echo "No changes" && exit 0
           git commit -m "fix: 恢复 __init__.py 并应用 v5.1.1 修复
 
           - 修复 _agent_dispatch 中 _user_processing 未设 True 的 BUG
           - 增强 System Prompt 上下文理解指令
           - 优化 _tool_download_resource 缓存缺失提示
           - 版本号同步至 5.1.1"
+          git push
+
+      - name: Self-cleanup workflow file
+        run: |
+          git rm .github/workflows/restore-init.yml
+          git commit -m "chore: remove temporary restore workflow"
           git push
