@@ -148,6 +148,74 @@ PLUGIN_MARKET=https://github.com/Tsutomu-miku/MoviePilot-Plugin-FeishuBot
 pip install lark-oapi
 ```
 
+## 🤖 Agent 模式技术方案
+
+### 多轮下载确认流程
+
+Agent 模式下，用户通过自然语言完成「搜索 → 选择 → 确认下载」三步交互。每一步都是独立的用户消息，触发独立的 Agent 循环。核心挑战是**跨消息保持上下文**。
+
+#### 数据流
+
+```
+用户消息 1: "下载电影 xxx"
+│
+├─ Agent Loop ─► search_resources("xxx")
+│                  └─► _resource_cache[user] = [ctx0, ctx1, ...]
+│                  └─► LLM 回复推荐列表
+├─ 保存对话历史 ✓
+│
+用户消息 2: "选择第3个"
+│
+├─ Agent Loop ─► download_resource(index=3, confirmed=false)
+│                  └─► _pending_download[user] = {index:3, title:...}
+│                  └─► LLM 回复资源详情，询问确认
+├─ 保存对话历史 ✓
+│
+用户消息 3: "确认下载"
+│
+├─ Agent Loop ─► download_resource(index=-1, confirmed=true)
+│                  └─► 从 _pending_download[user] 取回 index=3
+│                  └─► 补充 media_info (如缺失)
+│                  └─► DownloadChain.download_single(ctx)
+│                  └─► 清除 _pending_download[user]
+├─ 保存对话历史 ✓
+```
+
+#### 解决的问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 确认下载时 Agent 不知道要下载哪个 | 用户消息 3 触发新 Agent 循环，LLM 可能丢失上下文 | `_pending_download` 缓存：confirmed=false 时记住用户选择，confirmed=true 时 index=-1 自动回溯 |
+| 打断导致对话历史丢失 | 用户连续发消息触发打断机制，被打断的消息不保存历史 | 打断时仍保存已完成的对话上下文，后续消息可获得完整历史 |
+| download_resource 报错 NoneType | `SearchChain.search_by_title` 返回的 Context 不含 `media_info`，但 `DownloadChain.download_single` 访问 `context.media_info.category` | confirmed=true 执行前检测并调用 `MediaChain.recognize_media` 补充 |
+
+#### 关键状态存储
+
+| 存储 | 类型 | 生命周期 | 作用 |
+|------|------|----------|------|
+| `_resource_cache[user_id]` | `List[Context]` | search_resources 时写入 | 保存搜索到的种子资源列表 |
+| `_pending_download[user_id]` | `dict{index,title,...}` | confirmed=false 时写入，confirmed=true 后清除 | 记住用户待确认的下载选择 |
+| `_conversations` | `ConversationManager` | 每次 agent_handle 完成后保存 | 多轮对话历史（含 tool_calls） |
+| `_search_cache[user_id]` | `List[MediaInfo]` | search_media 时写入 | 保存影视搜索结果 |
+
+### 并发控制（打断 + 合并）
+
+```
+用户快速发送多条消息:
+
+msg_1 ──┐
+msg_2 ──┤  合并窗口 (1.5s)
+msg_3 ──┘
+         ↓
+    取最新消息 msg_3 开始处理
+         ↓
+    处理中... ← msg_4 到达 → 标记打断 + 存储 msg_4
+         ↓
+    当前轮次完成 → 保存已完成对话历史
+         ↓
+    检测到打断 → 取 msg_4 继续处理
+```
+
 ## 📁 目录结构
 
 ```
@@ -161,6 +229,20 @@ MoviePilot-Plugin-FeishuBot/
 ├── LICENSE                   # MIT License
 └── README.md                 # 本文件
 ```
+
+## 📋 更新日志
+
+| 版本 | 更新内容 |
+|------|----------|
+| v5.2.0 | 修复 Agent 多轮下载确认上下文丢失：新增 `_pending_download` 状态缓存 + 打断时保存对话历史 + `media_info` 补充识别 |
+| v5.1.3 | 修复执行错误导致的异常关闭 |
+| v5.1.1 | Agent 并发修复 + 下载容错增强 + System Prompt 上下文理解指令 |
+| v5.1.0 | 消息去重(msg_id幂等) + 并发竞态修复 + 即时反馈增强 + 卡片样式优化 |
+| v5.0.0 | Agent 并发控制重构 + 即时反馈卡片 + 飞书交互式卡片全面升级 |
+| v4.0.0 | 新增 WebSocket 长连接收消息，替代已失效的 HTTP 回调方式 |
+| v3.0.0 | 新增 Agent 智能对话模式 |
+| v2.0.0 | 新增搜索、订阅、下载等交互指令 |
+| v1.0.0 | 初始版本：飞书机器人消息通知 |
 
 ## 📝 许可证
 
