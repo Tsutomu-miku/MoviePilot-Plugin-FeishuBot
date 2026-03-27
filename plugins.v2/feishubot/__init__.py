@@ -1,5 +1,5 @@
 """
-飞书机器人插件 v5.1.2 — MoviePilot Agent Mode + WebSocket 长连接
+飞书机器人插件 v5.1.4 — MoviePilot Agent Mode + WebSocket 长连接
 
 更新记录 (v5.1.1):
 - **消息去重**: 基于 message_id 的幂等处理, 同一消息无论来自 WS 还是 HTTP 回调只处理一次
@@ -956,7 +956,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "5.1.3"
+    plugin_version = "5.1.4"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -1916,6 +1916,28 @@ class FeishuBot(_PluginBase):
             }
 
         try:
+            # --- 修复: search_by_title 返回的 Context 不含 media_info ---
+            # DownloadChain.download_single 内部会访问 context.media_info.category,
+            # 但 SearchChain.search_by_title 构建 Context 时未填充 media_info,
+            # 导致 NoneType has no attribute 'category'. 此处补充识别。
+            if not getattr(ctx, "media_info", None):
+                try:
+                    from app.chain.media import MediaChain
+                    _meta = getattr(ctx, "meta_info", None)
+                    _recognize_title = getattr(_meta, "name", None) or title
+                    _media = MediaChain().recognize_media(meta=_meta)
+                    if _media:
+                        ctx.media_info = _media
+                        logger.info(
+                            f"download_resource: 补充媒体识别成功 "
+                            f"title={_recognize_title}, tmdb={getattr(_media, 'tmdb_id', None)}"
+                        )
+                    else:
+                        logger.warning(f"download_resource: 无法识别媒体信息, title={_recognize_title}")
+                except Exception as me:
+                    logger.warning(f"download_resource: 媒体识别异常: {me}")
+            # --- 修复结束 ---
+
             from app.chain.download import DownloadChain
             result = DownloadChain().download_single(context=ctx, userid="feishu")
             if result:
