@@ -1,5 +1,5 @@
 """
-飞书机器人插件 v5.1.4 — MoviePilot Agent Mode + WebSocket 长连接
+飞书机器人插件 v5.2.0 — MoviePilot Agent Mode + WebSocket 长连接
 
 更新记录 (v5.1.1):
 - **消息去重**: 基于 message_id 的幂等处理, 同一消息无论来自 WS 还是 HTTP 回调只处理一次
@@ -802,23 +802,22 @@ _AGENT_TOOLS = [
             "name": "download_resource",
             "description": (
                 "下载指定序号的种子资源。必须先调用 search_resources 获取资源列表。\n\n"
-                "**重要**：此工具有两步确认机制：\n"
-                "1. 第一次调用：confirmed=false → 仅返回资源详情，不会下载\n"
-                "2. 用户明确确认后：confirmed=true → 执行实际下载\n\n"
-                "你必须先用 confirmed=false 获取详情并展示给用户，"
-                "等用户明确说「确认」「下载」「好的」等肯定回复后，"
-                "再用 confirmed=true 执行下载。绝对不要跳过确认步骤。"
+                "**两步确认机制**：\n"
+                "1. confirmed=false → 返回资源详情，系统会记住该选择\n"
+                "2. 用户确认后 → confirmed=true 执行下载\n\n"
+                "confirmed=true 时，如果不确定序号可传 index=-1，"
+                "系统会自动使用上次 confirmed=false 时记住的资源。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "index": {
                         "type": "integer",
-                        "description": "资源在 search_resources 返回列表中的序号（从 0 开始）",
+                        "description": "资源序号(从0开始)。confirmed=true 时可传 -1 表示使用上次待确认的资源",
                     },
                     "confirmed": {
                         "type": "boolean",
-                        "description": "是否已获得用户确认。首次推荐时必须设为 false，用户确认后设为 true",
+                        "description": "false=预览详情，true=执行下载",
                     },
                 },
                 "required": ["index", "confirmed"],
@@ -885,9 +884,10 @@ _AGENT_SYSTEM_PROMPT = """\
 2. 分析返回的 tags，根据用户偏好筛选排序
 3. 推荐 1-3 个最佳资源，用表格对比：
    - 序号 | 标题 | 站点 | 大小 | 标签
-4. 调用 download_resource(index=X, confirmed=false) 获取待下载资源详情
+4. 调用 download_resource(index=X, confirmed=false) 获取待下载资源详情（系统会记住此选择）
 5. **展示详情并明确询问用户是否确认下载**
 6. 用户确认后 → 调用 download_resource(index=X, confirmed=true) 执行下载
+   - 如果你不确定之前选的序号，可以传 index=-1，系统会自动使用上次待确认的资源
 7. **绝对禁止**未经用户确认就设置 confirmed=true
 
 ### 订阅
@@ -913,7 +913,8 @@ _AGENT_SYSTEM_PROMPT = """\
 ## 上下文理解
 - 当用户说"下载第X个""选第X个""要第X个"时，必须参考**最近一次搜索结果**，直接调用 download_resource
 - 如果上下文中已有 search_resources 的结果，不要重复搜索，直接用 download_resource(index=X, confirmed=false)
-- "这个""那个"等指代词通常指用户最近讨论的影视作品"""
+- "这个""那个"等指代词通常指用户最近讨论的影视作品
+- 当用户说"确认""确认下载""好的下载吧"等肯定回复时，说明用户在确认之前待确认的资源，直接调用 download_resource(index=-1, confirmed=true)"""
 
 
 # ╔════════════════════════════════════════════════════════════════════╗
@@ -956,7 +957,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "5.1.4"
+    plugin_version = "5.2.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -1038,6 +1039,7 @@ class FeishuBot(_PluginBase):
         self._feishu = _FeishuAPI(self._app_id, self._app_secret)
         self._search_cache = {}
         self._resource_cache = {}
+        self._pending_download = {}
         self._user_locks = {}
         self._user_pending_msg = {}
         self._user_interrupted = {}
@@ -1126,6 +1128,7 @@ class FeishuBot(_PluginBase):
         self._feishu = None
         self._search_cache = None
         self._resource_cache = None
+        self._pending_download = None
         self._user_locks = None
         self._user_pending_msg = None
         self._user_interrupted = None
@@ -1285,6 +1288,8 @@ class FeishuBot(_PluginBase):
             self._search_cache = {}
         if self._resource_cache is None:
             self._resource_cache = {}
+        if self._pending_download is None:
+            self._pending_download = {}
         if self._user_locks is None:
             self._user_locks = {}
         if self._user_pending_msg is None:
@@ -1629,8 +1634,8 @@ class FeishuBot(_PluginBase):
 
             # ── 检查是否被打断 ──
             if self._user_interrupted.get(user_id, False):
-                logger.info(f"[Agent] 用户 {user_id} 处理被打断，放弃当前回复")
-                # 不保存对话、不发送回复（新消息会重新处理）
+                logger.info(f"[Agent] 用户 {user_id} 处理被打断，保存已完成对话上下文")
+                self._conversations.save(user_id, updated)
                 return
 
             # ── 发送最终回复 ──
@@ -1890,10 +1895,53 @@ class FeishuBot(_PluginBase):
             return {"error": str(e)}
 
     def _tool_download_resource(self, index: int, confirmed: bool, user_id: str) -> dict:
-        """下载资源 — confirmed=false 仅返回详情，confirmed=true 才执行下载"""
+        """下载资源 — confirmed=false 返回详情并缓存待确认状态，confirmed=true 执行下载"""
         cached = (self._resource_cache or {}).get(user_id, [])
+
+        if confirmed:
+            pending = (self._pending_download or {}).get(user_id)
+            if pending and (index == -1 or index == pending["index"]):
+                index = pending["index"]
+            if not cached:
+                return {"status": "error", "message": "没有缓存的搜索结果，请先搜索资源。"}
+            if index < 0 or index >= len(cached):
+                if pending:
+                    index = pending["index"]
+                else:
+                    return {"error": f"序号 {index} 无效且无待确认下载，请先选择资源。"}
+
+            ctx = cached[index]
+            t = getattr(ctx, "torrent_info", None)
+            title = getattr(t, "title", "未知") if t else "未知"
+
+            try:
+                if not getattr(ctx, "media_info", None):
+                    try:
+                        from app.chain.media import MediaChain
+                        _meta = getattr(ctx, "meta_info", None)
+                        _media = MediaChain().recognize_media(meta=_meta)
+                        if _media:
+                            ctx.media_info = _media
+                            logger.info(f"download_resource: 补充媒体识别成功 title={title}")
+                        else:
+                            logger.warning(f"download_resource: 无法识别媒体信息 title={title}")
+                    except Exception as me:
+                        logger.warning(f"download_resource: 媒体识别异常: {me}")
+
+                from app.chain.download import DownloadChain
+                result = DownloadChain().download_single(context=ctx, userid="feishu")
+                if self._pending_download is not None:
+                    self._pending_download.pop(user_id, None)
+                if result:
+                    return {"success": True, "title": title, "message": f"✅ 已添加下载: {title}"}
+                else:
+                    return {"success": False, "title": title, "message": "下载提交失败"}
+            except Exception as e:
+                logger.error(f"download_resource 异常: {e}", exc_info=True)
+                return {"error": str(e)}
+
         if not cached:
-            return {"status": "error", "message": "当前没有缓存的搜索结果。请先告诉我你想搜索什么影视资源，我会先用 search_resources 搜索，然后你再选择下载。"}
+            return {"status": "error", "message": "当前没有缓存的搜索结果。请先用 search_resources 搜索。"}
         if index < 0 or index >= len(cached):
             return {"error": f"序号 {index} 无效，有效范围: 0-{len(cached)-1}"}
 
@@ -1903,50 +1951,19 @@ class FeishuBot(_PluginBase):
         size = getattr(t, "size", "未知") if t else "未知"
         site = getattr(t, "site_name", "未知") if t else "未知"
 
-        if not confirmed:
-            return {
-                "status": "pending_confirmation",
-                "index": index, "title": title, "size": size, "site": site,
-                "tags": _extract_tags(title),
-                "message": (
-                    f"资源「{title}」（{site}, {size}）等待用户确认。"
-                    "请向用户展示资源信息并明确询问是否确认下载。"
-                    "用户确认后再次调用 download_resource 并设置 confirmed=true。"
-                ),
-            }
+        if self._pending_download is not None:
+            self._pending_download[user_id] = {"index": index, "title": title, "size": size, "site": site}
 
-        try:
-            # --- 修复: search_by_title 返回的 Context 不含 media_info ---
-            # DownloadChain.download_single 内部会访问 context.media_info.category,
-            # 但 SearchChain.search_by_title 构建 Context 时未填充 media_info,
-            # 导致 NoneType has no attribute 'category'. 此处补充识别。
-            if not getattr(ctx, "media_info", None):
-                try:
-                    from app.chain.media import MediaChain
-                    _meta = getattr(ctx, "meta_info", None)
-                    _recognize_title = getattr(_meta, "name", None) or title
-                    _media = MediaChain().recognize_media(meta=_meta)
-                    if _media:
-                        ctx.media_info = _media
-                        logger.info(
-                            f"download_resource: 补充媒体识别成功 "
-                            f"title={_recognize_title}, tmdb={getattr(_media, 'tmdb_id', None)}"
-                        )
-                    else:
-                        logger.warning(f"download_resource: 无法识别媒体信息, title={_recognize_title}")
-                except Exception as me:
-                    logger.warning(f"download_resource: 媒体识别异常: {me}")
-            # --- 修复结束 ---
-
-            from app.chain.download import DownloadChain
-            result = DownloadChain().download_single(context=ctx, userid="feishu")
-            if result:
-                return {"success": True, "title": title, "message": f"✅ 已添加下载: {title}"}
-            else:
-                return {"success": False, "title": title, "message": "下载提交失败"}
-        except Exception as e:
-            logger.error(f"download_resource 异常: {e}", exc_info=True)
-            return {"error": str(e)}
+        return {
+            "status": "pending_confirmation",
+            "index": index, "title": title, "size": size, "site": site,
+            "tags": _extract_tags(title),
+            "message": (
+                f"资源「{title}」（{site}, {size}）等待用户确认。"
+                "请向用户展示资源信息并明确询问是否确认下载。"
+                "用户确认后调用 download_resource(index={idx}, confirmed=true) 执行下载。".format(idx=index)
+            ),
+        }
 
     def _tool_subscribe_media(self, index: Optional[int], keyword: Optional[str], user_id: str) -> dict:
         mediainfo = None
