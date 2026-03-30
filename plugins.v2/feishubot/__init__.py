@@ -1,5 +1,5 @@
 """
-飞书机器人插件 v5.2.0 — MoviePilot Agent Mode + WebSocket 长连接
+飞书机器人插件 v5.3.0 — MoviePilot Agent Mode + WebSocket 长连接
 
 更新记录 (v5.1.1):
 - **消息去重**: 基于 message_id 的幂等处理, 同一消息无论来自 WS 还是 HTTP 回调只处理一次
@@ -110,7 +110,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "5.2.0"
+    plugin_version = "5.3.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -1389,12 +1389,12 @@ class FeishuBot(_PluginBase):
             self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
 
     def _card_subscribe(self, idx: int, user_id: str, chat_id: str):
-result = self._tool_subscribe_media(idx, None, user_id)
+        result = self._tool_subscribe_media(idx, None, user_id)
         msg = result.get("message") or result.get("error", "操作失败")
         if result.get("success"):
             self._feishu.send_card(
                 chat_id,
-                _CardBuilder.notify_card("✅ 订阅成功", msg, "green"),
+                _CardBuilder.notify_card("✅ 订阅成功",msg, "green"),
             )
         else:
             self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
