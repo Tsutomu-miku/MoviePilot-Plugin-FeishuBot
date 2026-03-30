@@ -43,7 +43,7 @@
 # ══════════════════════════════════════════════════════════════════════
 
 def init_plugin_ai_section(self, openrouter_key, openrouter_model):
-    """init_plugin 中 AI 初始化部分的替换代码"""
+    """​init_plugin 中 AI 初始化部分的替换代码"""
     from .ai import ChatEngine
     from .utils import _extract_tags
 
@@ -73,7 +73,7 @@ def init_plugin_ai_section(self, openrouter_key, openrouter_model):
 # ══════════════════════════════════════════════════════════════════════
 
 def handle_message_routing_section(self, text, chat_id, msg_id, user_id):
-    """_handle_message 中 Agent 路由部分的替换代码"""
+    """​_handle_message 中 Agent 路由部分的替换代码"""
 
     # ── /clear 指令 ──
     if text in ("/clear", "/清除", "清除对话", "重新开始"):
@@ -87,10 +87,29 @@ def handle_message_routing_section(self, text, chat_id, msg_id, user_id):
             )
         return
 
-    # ── Agent 模式（替换原 _agent_dispatch → _agent_merge_and_run → _agent_handle） ──
+    # ══════════════════════════════════════════════════════════
+    #  ★ 关键改造：并发安全的消息路由
+    # ══════════════════════════════════════════════════════════
     if self._engine is not None:
-        logger.info(f"[Agent] 路由到 ChatEngine: {text[:80]}")
-        # 直接在 daemon 线程中调用，不再需要消息合并和打断机制
+        logger.info(f"[Agent] 收到消息: {text[:80]}")
+
+        if self._engine.is_busy:
+            # ── 引擎忙碌：排队 + 通知用户，不创建新线程 ──
+            self._engine.enqueue(text)
+            logger.info(f"[Agent] 引擎忙碌，消息已排队: '{text[:40]}'")
+            if self._feishu:
+                self._feishu.send_card(
+                    chat_id,
+                    _CardBuilder.notify_card(
+                        "📝 已收到",
+                        f"正在处理上一条消息，你的新消息「{text[:30]}」排队中，稍后自动处理。",
+                        "blue",
+                    ),
+                    reply_msg_id=msg_id,
+                )
+            return  # ← 不创建新线程！当前线程处理完后会自动消费排队消息
+
+        # ── 引擎空闲：正常启动 ──
         import threading
         threading.Thread(
             target=self._agent_handle_v2,
@@ -104,79 +123,91 @@ def handle_message_routing_section(self, text, chat_id, msg_id, user_id):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  改造点 5: 新的 _agent_handle_v2（替换旧的 6 个方法）
+#  改造点 5: 全新 _agent_handle_v2（内置排队消费循环）
 # ══════════════════════════════════════════════════════════════════════
 
 def _agent_handle_v2(self, text: str, chat_id: str, msg_id: str):
     """
-    全新 Agent 处理方法 — 替换旧的 _agent_dispatch / _agent_merge_and_run /
-    _agent_handle / _agent_loop / _execute_tool 共 5 个方法。
+    全新 Agent 处理方法 — 替换旧的 5 个方法。
 
-    极度简化：
-    1. 发送「处理中」卡片
-    2. engine.chat_with_progress(text) — 一行搞定
-    3. 更新卡片为最终回复
+    关键设计：
+    1. engine.chat_with_progress() 内部有锁，保证同一时间只有一个在运行
+    2. 处理完成后检查排队消息，在同一个线程中继续处理（不创建新线程）
+    3. 连续多条消息不会产生并发冲突
     """
     import time as _time
-    _t0 = _time.monotonic()
 
-    # ── 即时反馈 ──
-    processing_card = _CardBuilder.processing_card(text)
-    send_result = self._feishu.send_card(chat_id, processing_card, reply_msg_id=msg_id)
-    status_msg_id = ""
-    try:
-        status_msg_id = send_result.get("data", {}).get("message_id", "")
-    except Exception:
-        pass
+    while True:  # ← 排队消费循环
+        _t0 = _time.monotonic()
 
-    try:
-        # ── 进度回调: 更新卡片 ──
-        step_log_display = []
+        # ── 即时反馈 ──
+        processing_card = _CardBuilder.processing_card(text)
+        send_result = self._feishu.send_card(chat_id, processing_card, reply_msg_id=msg_id)
+        status_msg_id = ""
+        try:
+            status_msg_id = send_result.get("data", {}).get("message_id", "")
+        except Exception:
+            pass
 
-        def on_tool_start(tool_name: str, tool_args: dict):
-            from .ai.tools import friendly_tool_name
-            friendly = friendly_tool_name(tool_name, tool_args)
-            step_log_display.append(friendly)
-            if status_msg_id and self._feishu:
-                try:
-                    progress_card = _CardBuilder.agent_tool_progress_card(
-                        text, step_log_display[:-1], step_log_display[-1]
-                    )
-                    self._feishu.update_card(status_msg_id, progress_card)
-                except Exception:
-                    pass
+        try:
+            # ── 进度回调 ──
+            step_log_display = []
 
-        # ══ 核心: 一行调用 ══
-        reply, steps = self._engine.chat_with_progress(
-            text,
-            on_tool_start=on_tool_start,
-        )
+            def on_tool_start(tool_name: str, tool_args: dict):
+                from .ai.tools import friendly_tool_name
+                friendly = friendly_tool_name(tool_name, tool_args)
+                step_log_display.append(friendly)
+                if status_msg_id and self._feishu:
+                    try:
+                        progress_card = _CardBuilder.agent_tool_progress_card(
+                            text, step_log_display[:-1], step_log_display[-1]
+                        )
+                        self._feishu.update_card(status_msg_id, progress_card)
+                    except Exception:
+                        pass
 
-        # ── 发送最终回复 ──
-        elapsed = _time.monotonic() - _t0
-        if reply:
-            final_card = _CardBuilder.agent_reply_card(reply, elapsed)
-            if status_msg_id:
-                self._feishu.update_card(status_msg_id, final_card)
+            # ══ 核心: engine 内部有锁，线程安全 ══
+            reply, steps = self._engine.chat_with_progress(
+                text,
+                on_tool_start=on_tool_start,
+            )
+
+            # ── 发送最终回复 ──
+            elapsed = _time.monotonic() - _t0
+            if reply:
+                final_card = _CardBuilder.agent_reply_card(reply, elapsed)
+                if status_msg_id:
+                    self._feishu.update_card(status_msg_id, final_card)
+                else:
+                    self._feishu.send_card(chat_id, final_card, reply_msg_id=msg_id)
             else:
-                self._feishu.send_card(chat_id, final_card, reply_msg_id=msg_id)
-        else:
-            error_card = _CardBuilder.error_card("AI 没有生成回复，请再试试~")
+                error_card = _CardBuilder.error_card("AI 没有生成回复，请再试试~")
+                if status_msg_id:
+                    self._feishu.update_card(status_msg_id, error_card)
+                else:
+                    self._feishu.send_card(chat_id, error_card)
+
+        except Exception as e:
+            logger.error(f"Agent 异常: {e}", exc_info=True)
+            error_card = _CardBuilder.error_card(f"AI 处理出错: {e}")
             if status_msg_id:
                 self._feishu.update_card(status_msg_id, error_card)
-            else:
+            elif self._feishu:
                 self._feishu.send_card(chat_id, error_card)
+        finally:
+            _elapsed = _time.monotonic() - _t0
+            logger.info(f"[Agent] 完成: elapsed={_elapsed:.1f}s")
 
-    except Exception as e:
-        logger.error(f"Agent 异常: {e}", exc_info=True)
-        error_card = _CardBuilder.error_card(f"AI 处理出错: {e}")
-        if status_msg_id:
-            self._feishu.update_card(status_msg_id, error_card)
-        elif self._feishu:
-            self._feishu.send_card(chat_id, error_card)
-    finally:
-        _elapsed = _time.monotonic() - _t0
-        logger.info(f"[Agent] 完成: elapsed={_elapsed:.1f}s")
+        # ════════════════════════════════════════════════════════
+        #  ★ 排队消费：检查是否有新消息在处理期间到达
+        # ════════════════════════════════════════════════════════
+        pending = self._engine.drain_pending()
+        if pending is None:
+            break  # 没有排队消息 → 结束
+        logger.info(f"[Agent] 消费排队消息: '{pending[:50]}'")
+        text = pending
+        msg_id = ""  # 排队消息不 reply 原消息
+        # continue → 回到 while 循环顶部处理下一条
 
 
 # ══════════════════════════════════════════════════════════════════════

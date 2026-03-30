@@ -8,6 +8,7 @@ AI 对话系统 — ChatEngine 主引擎
 
 import json as _json
 import time as _time
+import threading
 from typing import Callable, Optional, Tuple, List
 
 from app.log import logger
@@ -48,13 +49,12 @@ def _sanitize_assistant_message(raw_msg: dict) -> dict:
 
 class ChatEngine:
     """
-    AI 对话主引擎 — 单用户版本。
+    AI 对话主引擎 — 单用户版本，内置并发安全。
 
-    职责：
-    - 管理对话历史 (ChatHistory)
-    - 调用 LLM (LLMClient)
-    - 执行工具循环 (ToolExecutor)
-    - 提供进度回调接口
+    核心保证：
+    - 同一时间只有一个 _agent_loop 在运行（通过 _lock 实现）
+    - 新消息在引擎忙碌时自动排队（latest-wins 策略）
+    - 处理完成后自动消费排队消息，不会丢失
 
     Usage:
         engine = ChatEngine(api_key="...", model="...")
@@ -63,8 +63,11 @@ class ChatEngine:
         # 简单模式
         reply = engine.chat("搜索流浪地球")
 
-        # 带进度回调
+        # 带进度回调（推荐）
         reply, steps = engine.chat_with_progress("搜索流浪地球")
+
+        # 仅排队（引擎忙碌时）
+        engine.enqueue("下载第3个")
     """
 
     def __init__(self, api_key: str, model: str = "", base_url: str = ""):
@@ -73,15 +76,39 @@ class ChatEngine:
         self.llm = LLMClient(api_key=api_key, model=model, base_url=base_url)
         self.executor = ToolExecutor(self.state)
 
-    # ════════════════════════════════════════════════════════════════
+        # ── 并发控制 ──
+        self._lock = threading.Lock()
+        self._pending_text: Optional[str] = None  # 排队中的最新消息 (latest-wins)
+
+    # ════════════════════════════════════════════════════════════
     #  公开接口
-    # ════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════
+
+    @property
+    def is_busy(self) -> bool:
+        """引擎是否正在处理中"""
+        return self.state.is_processing
+
+    def enqueue(self, text: str):
+        """
+        排队一条消息（引擎忙碌时使用）。
+        如果已有排队消息，新消息覆盖旧消息（latest-wins）。
+        """
+        self._pending_text = text
+        logger.info(f"ChatEngine: 消息已排队 '{text[:50]}'")
+
+    def drain_pending(self) -> Optional[str]:
+        """取出并清空排队消息，返回 None 表示无排队。"""
+        text = self._pending_text
+        self._pending_text = None
+        return text
 
     def chat(self, text: str) -> str:
         """
         处理用户消息，返回 AI 回复文本。
 
         最简接口 — 不需要进度回调时使用。
+        带锁保护：如果引擎忙碌，会阻塞等待。
         """
         reply, _ = self.chat_with_progress(text)
         return reply
@@ -95,6 +122,9 @@ class ChatEngine:
         """
         处理用户消息，返回 (AI 回复文本, 工具步骤列表)。
 
+        线程安全：通过 _lock 保证同一时间只有一个调用在执行。
+        如果另一个线程已在处理，本调用会阻塞等待。
+
         Args:
             text:           用户消息
             on_tool_start:  工具开始执行时的回调 (tool_name, tool_args)
@@ -103,12 +133,40 @@ class ChatEngine:
         Returns:
             (reply_text, step_log)
         """
+        with self._lock:
+            return self._do_chat(text, on_tool_start, on_tool_done)
+
+    def reset(self):
+        """重置对话（清空历史 + 全部状态 + 排队消息）"""
+        self.history.clear()
+        self.state.clear_all()
+        self._pending_text = None
+        logger.info("ChatEngine: 对话已重置")
+
+    @property
+    def model_name(self) -> str:
+        return self.llm.model
+
+    # ════════════════════════════════════════════════════════════
+    #  内部实现
+    # ════════════════════════════════════════════════════════════
+
+    def _do_chat(
+        self,
+        text: str,
+        on_tool_start: Optional[Callable] = None,
+        on_tool_done: Optional[Callable] = None,
+    ) -> Tuple[str, List[str]]:
+        """实际处理逻辑（调用方已持有锁）"""
         # 对话过期自动重置
         if self.history.is_stale():
             self.reset()
 
         self.state.is_processing = True
         try:
+            # 清除排队消息（即将处理的就是最新消息）
+            self._pending_text = None
+
             # 添加用户消息
             self.history.append({"role": "user", "content": text})
 
@@ -118,23 +176,9 @@ class ChatEngine:
         finally:
             self.state.is_processing = False
 
-    def reset(self):
-        """重置对话（清空历史 + 全部状态）"""
-        self.history.clear()
-        self.state.clear_all()
-        logger.info("ChatEngine: 对话已重置")
-
-    @property
-    def is_processing(self) -> bool:
-        return self.state.is_processing
-
-    @property
-    def model_name(self) -> str:
-        return self.llm.model
-
-    # ════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════
     #  Agent Loop（核心循环）
-    # ════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════
 
     def _agent_loop(
         self,
