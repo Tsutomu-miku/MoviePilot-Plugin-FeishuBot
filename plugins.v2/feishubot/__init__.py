@@ -100,6 +100,7 @@ from .utils import _HAS_LARK_SDK, _extract_tags, lark, LarkWSClient, EventDispat
 from .feishu_api import _FeishuAPI
 from .card_builder import _CardBuilder
 from .ai import ChatEngine
+from .ai.llm import DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, FREE_MODEL_CHOICES
 
 
 class FeishuBot(_PluginBase):
@@ -108,7 +109,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "6.0.0"
+    plugin_version = "6.0.1"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -124,6 +125,9 @@ class FeishuBot(_PluginBase):
     _llm_enabled: bool = False
     _openrouter_key: str = ""
     _openrouter_model: str = ""
+    _openrouter_free_model: str = DEFAULT_MODEL
+    _openrouter_fallback_models: list = []
+    _openrouter_auto_fallback: bool = True
     _use_ws: bool = True
 
     # ── 运行时 ──
@@ -135,6 +139,68 @@ class FeishuBot(_PluginBase):
     _ws_client: Optional[Any] = None
     _ws_thread: Optional[threading.Thread] = None
     _ws_running: bool = False
+
+    @staticmethod
+    def _parse_bool_config(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @staticmethod
+    def _parse_str_list_config(value: Any) -> List[str]:
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            items = re.split(r"[,;\n]", value)
+        elif value is None:
+            items = []
+        else:
+            items = [value]
+
+        result = []
+        seen = set()
+        for item in items:
+            normalized = str(item or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            result.append(normalized)
+            seen.add(normalized)
+        return result
+
+    def _get_ai_model_chain(self) -> List[str]:
+        primary = str(
+            self._openrouter_model or self._openrouter_free_model or DEFAULT_MODEL
+        ).strip() or DEFAULT_MODEL
+        fallback_models = self._parse_str_list_config(self._openrouter_fallback_models)
+        if not fallback_models and self._openrouter_auto_fallback:
+            fallback_models = list(DEFAULT_FALLBACK_MODELS)
+
+        chain = []
+        for model in [primary] + fallback_models:
+            model = str(model or "").strip()
+            if model and model not in chain:
+                chain.append(model)
+        return chain or [DEFAULT_MODEL]
+
+    def _create_chat_engine(self) -> ChatEngine:
+        model_chain = self._get_ai_model_chain()
+        engine = ChatEngine(
+            api_key=self._openrouter_key,
+            model=model_chain[0],
+            fallback_models=model_chain[1:],
+            auto_fallback=self._openrouter_auto_fallback,
+        )
+        engine.executor.bind(extract_tags=_extract_tags)
+        return engine
+
+    def _get_ai_status_model(self) -> str:
+        if self._engine:
+            return self._engine.resolved_model_name
+        return self._get_ai_model_chain()[0]
 
 
 
@@ -165,16 +231,18 @@ class FeishuBot(_PluginBase):
             else:
                 self._use_ws = bool(ws_raw)
 
-            llm_raw = config.get("llm_enabled")
-            if isinstance(llm_raw, bool):
-                self._llm_enabled = llm_raw
-            elif isinstance(llm_raw, str):
-                self._llm_enabled = llm_raw.lower() in ("true", "1", "yes", "on")
-            else:
-                self._llm_enabled = bool(llm_raw) if llm_raw is not None else False
-
+            self._llm_enabled = self._parse_bool_config(config.get("llm_enabled"), False)
             self._openrouter_key = str(config.get("openrouter_key", "") or "").strip()
+            self._openrouter_free_model = str(
+                config.get("openrouter_free_model", "") or ""
+            ).strip() or DEFAULT_MODEL
             self._openrouter_model = str(config.get("openrouter_model", "") or "").strip()
+            self._openrouter_fallback_models = self._parse_str_list_config(
+                config.get("openrouter_fallback_models")
+            )
+            self._openrouter_auto_fallback = self._parse_bool_config(
+                config.get("openrouter_auto_fallback"), True
+            )
 
         self._feishu = _FeishuAPI(self._app_id, self._app_secret)
         self._engine = None
@@ -205,20 +273,15 @@ class FeishuBot(_PluginBase):
             f"飞书配置: enabled={self._enabled}, llm_enabled={self._llm_enabled}, "
             f"use_ws={self._use_ws}, lark_sdk={'✓' if _HAS_LARK_SDK else '✗'}, "
             f"api_key={'已配置' if self._openrouter_key else '未配置'}, "
-            f"model={self._openrouter_model or 'default'}"
+            f"ai_models={' -> '.join(self._get_ai_model_chain())}"
         )
 
         if self._llm_enabled and self._openrouter_key:
             try:
-                from .ai import ChatEngine
-                self._engine = ChatEngine(
-                    api_key=self._openrouter_key,
-                    model=self._openrouter_model,
-                )
-                self._engine.executor.bind(extract_tags=_extract_tags)
+                self._engine = self._create_chat_engine()
                 logger.info(
                     f"飞书 Agent 模式已启用 ✓ inst={id(self):#x}, "
-                    f"模型: {self._engine.model_name}"
+                    f"模型链: {' -> '.join(self._engine.model_chain)}"
                 )
             except Exception as e:
                 logger.error(f"飞书 Agent 初始化失败: {e}", exc_info=True)
@@ -415,12 +478,7 @@ class FeishuBot(_PluginBase):
         if self._llm_enabled and self._openrouter_key:
             if self._engine is None:
                 try:
-                    from .ai import ChatEngine
-                    self._engine = ChatEngine(
-                        api_key=self._openrouter_key,
-                        model=self._openrouter_model,
-                    )
-                    self._engine.executor.bind(extract_tags=_extract_tags)
+                    self._engine = self._create_chat_engine()
                     recovered.append("engine")
                 except Exception as e:
                     logger.error(f"Agent ChatEngine 恢复失败: {e}")
@@ -892,7 +950,7 @@ class FeishuBot(_PluginBase):
     # ══════════════════════════════════════════════════════════════════════
 
     def _cmd_status(self, chat_id: str, msg_id: str):
-        model = self._engine.model_name if self._engine else (self._openrouter_model or "default")
+        model = self._get_ai_status_model()
         cache_media = 0
         cache_res = 0
 
@@ -1056,6 +1114,10 @@ class FeishuBot(_PluginBase):
             {"title": "订阅", "value": "subscribe"},
             {"title": "站点消息", "value": "site"},
         ]
+        FreeModelOptions = [
+            {"title": item["title"], "value": item["value"]}
+            for item in FREE_MODEL_CHOICES
+        ]
         return [
             {
                 "component": "VForm",
@@ -1093,10 +1155,9 @@ class FeishuBot(_PluginBase):
                             {"component": "VAlert", "props": {
                                 "type": "info", "variant": "tonal",
                                 "text": (
-                                    "💡 WebSocket 长连接模式（推荐）：无需公网 IP、域名或 HTTPS，NAS/Docker 友好。\n"
+                                    "WebSocket 长连接模式（推荐）：无需公网 IP、域名或 HTTPS，NAS/Docker 友好。\n"
                                     "需安装 lark-oapi：在容器中执行 pip install lark-oapi\n"
-                                    "飞书应用后台 → 事件订阅 → 选择「使用长连接接收」\n\n"
-                                    "关闭 WebSocket 后回退到 HTTP 回调模式（需公网可达地址）。"
+                                    "飞书应用后台 -> 事件订阅 -> 选择“使用长连接接收”。"
                                 ),
                             }},
                         ]},
@@ -1110,11 +1171,30 @@ class FeishuBot(_PluginBase):
                             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                                 {"component": "VSwitch", "props": {"model": "llm_enabled", "label": "启用 AI Agent"}},
                             ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
                                 {"component": "VTextField", "props": {"model": "openrouter_key", "label": "OpenRouter API Key", "placeholder": "sk-or-v1-..."}},
                             ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
-                                {"component": "VTextField", "props": {"model": "openrouter_model", "label": "模型 (可选)", "placeholder": "默认: google/gemini-2.5-flash-preview:free"}},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                                {"component": "VSwitch", "props": {"model": "openrouter_auto_fallback", "label": "自动切换后备免费模型"}},
+                            ]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VSelect", "props": {"model": "openrouter_free_model", "label": "免费主模型", "items": FreeModelOptions}},
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VSelect", "props": {"model": "openrouter_fallback_models", "label": "免费后备模型", "multiple": True, "chips": True, "items": FreeModelOptions}},
+                            ]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VTextField", "props": {"model": "openrouter_model", "label": "自定义模型（可选，优先于免费主模型）", "placeholder": "例如：openai/gpt-4o-mini；留空则走免费主模型"}},
                             ]},
                         ],
                     },
@@ -1124,8 +1204,8 @@ class FeishuBot(_PluginBase):
                             {"component": "VAlert", "props": {
                                 "type": "info", "variant": "tonal",
                                 "text": (
-                                    "开启 AI Agent 后，机器人将化身智能体：自动理解自然语言、"
-                                    "按偏好筛选资源（4K/杜比/5.1 等）、多轮对话确认后下载。\n"
+                                    "AI Agent 的实际能力是：理解自然语言、搜索影视、按偏好筛选资源、二次确认下载、订阅和查询下载进度。\n"
+                                    "默认推荐 OpenRouter 免费路由；当具体免费模型限流、下线或无可用 provider 时，会自动切换到后备模型。\n"
                                     "API Key: https://openrouter.ai/settings/keys"
                                 ),
                             }},
@@ -1134,9 +1214,18 @@ class FeishuBot(_PluginBase):
                 ],
             }
         ], {
-            "enabled": False, "use_ws": True, "app_id": "", "app_secret": "", "chat_id": "",
+            "enabled": False,
+            "use_ws": True,
+            "app_id": "",
+            "app_secret": "",
+            "chat_id": "",
             "msgtypes": ["transfer", "download"],
-            "llm_enabled": False, "openrouter_key": "", "openrouter_model": "",
+            "llm_enabled": False,
+            "openrouter_key": "",
+            "openrouter_model": "",
+            "openrouter_free_model": DEFAULT_MODEL,
+            "openrouter_fallback_models": list(DEFAULT_FALLBACK_MODELS),
+            "openrouter_auto_fallback": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -1151,7 +1240,7 @@ class FeishuBot(_PluginBase):
 
             feishu_ok = getattr(self, "_feishu_ok", False)
             agent_active = self._engine is not None
-            model = self._engine.model_name if self._engine else (self._openrouter_model or "default")
+            model = self._get_ai_status_model()
 
             ws_status = "未启用"
             if self._use_ws:
