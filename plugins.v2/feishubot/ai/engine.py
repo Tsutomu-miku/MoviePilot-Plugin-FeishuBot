@@ -65,20 +65,25 @@ class ChatEngine:
         self.executor = ToolExecutor(self.state)
 
         self._lock = threading.Lock()
-        self._pending_text: Optional[str] = None
+        self._pending_messages: List[dict] = []
 
     @property
     def is_busy(self) -> bool:
         return self.state.is_processing
 
-    def enqueue(self, text: str):
-        self._pending_text = text
-        logger.info(f"ChatEngine: 消息已排队 '{text[:50]}'")
+    def enqueue(self, message: dict):
+        queued = dict(message or {})
+        self._pending_messages.append(queued)
+        text = queued.get("text", "")
+        logger.info(
+            f"ChatEngine: 消息已排队 '{text[:50]}', queue_size={len(self._pending_messages)}"
+        )
 
-    def drain_pending(self) -> Optional[str]:
-        text = self._pending_text
-        self._pending_text = None
-        return text
+    def drain_pending(self) -> Optional[dict]:
+        if not self._pending_messages:
+            return None
+        message = self._pending_messages.pop(0)
+        return message
 
     def chat(self, text: str) -> str:
         reply, _ = self.chat_with_progress(text)
@@ -96,7 +101,7 @@ class ChatEngine:
     def reset(self):
         self.history.clear()
         self.state.clear_all()
-        self._pending_text = None
+        self._pending_messages.clear()
         logger.info("ChatEngine: 对话已重置")
 
     @property
@@ -130,7 +135,6 @@ class ChatEngine:
 
         self.state.is_processing = True
         try:
-            self._pending_text = None
             self.history.append({"role": "user", "content": text})
             reply, step_log = self._agent_loop(on_tool_start, on_tool_done)
             return reply, step_log

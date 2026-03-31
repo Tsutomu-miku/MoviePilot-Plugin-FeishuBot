@@ -1,6 +1,12 @@
 """
-飞书机器人插件 v6.0.0 — ChatEngine 重构 + WebSocket 长连接
+飞书机器人插件 v6.0.2 — ChatEngine 重构 + WebSocket 长连接
 
+更新记录 (v6.0.2):
+- **会话隔离修复**: ChatEngine 从全局单实例改为按 `chat_id + user_id` 维度隔离，避免确认消息串会话或上下文丢失
+- **队列与并发修复**: 同一会话使用 FIFO 消息队列 + dispatch lock + running 状态，避免旧会话与新消息并发回复
+- **确认流程短路**: 待确认下载存在时，"确认/下载吧/取消" 等短回复直接命中状态机，不再依赖 LLM 猜测上下文
+- **动作幂等增强**: 为文本确认、卡片确认下载和订阅按钮增加短期幂等保护，降低重复触发导致的重复下载风险
+- **运行时治理**: 新增会话 TTL 清理、结构化 trace 日志与状态页会话计数，便于长期运行排障
 更新记录 (v5.1.1):
 - **消息去重**: 基于 message_id 的幂等处理, 同一消息无论来自 WS 还是 HTTP 回调只处理一次
 - **并发竞态修复**: _agent_dispatch 使用 _dispatch_lock 保护 check-then-act 操作
@@ -104,12 +110,21 @@ from .ai.llm import DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, FREE_MODEL_CHOICES
 
 
 class FeishuBot(_PluginBase):
+    _SESSION_TTL_SECONDS = 3600
+    _ACTION_DEDUPE_TTL_SECONDS = 15
+    _DIRECT_CONFIRM_TEXTS = {
+        "确认", "确认下载", "确定", "确定下载", "好的", "好", "下载吧", "好下载吧",
+        "行", "行吧", "可以", "可以下载", "开始下载", "继续下载", "是", "是的",
+    }
+    _DIRECT_CANCEL_TEXTS = {
+        "取消", "取消下载", "不用了", "先不要", "不要下载", "算了",
+    }
 
     # ── 插件元信息 ──
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "6.0.1"
+    plugin_version = "6.0.2"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -132,7 +147,12 @@ class FeishuBot(_PluginBase):
 
     # ── 运行时 ──
     _feishu: Optional[_FeishuAPI] = None
-    _engine: Optional[ChatEngine] = None
+    _engines: Optional[dict] = None
+    _session_running: Optional[dict] = None
+    _session_dispatch_locks: Optional[dict] = None
+    _engine_pool_lock: Optional[threading.Lock] = None
+    _recent_actions: Optional[dict] = None
+    _recent_actions_lock: Optional[threading.Lock] = None
     _seen_msg_ids: Optional[dict] = None         # msg_id -> timestamp (消息去重)
 
     # ── WebSocket 长连接运行时 ──
@@ -186,6 +206,43 @@ class FeishuBot(_PluginBase):
                 chain.append(model)
         return chain or [DEFAULT_MODEL]
 
+    @staticmethod
+    def _session_key(chat_id: str, user_id: str) -> str:
+        chat = str(chat_id or "").strip() or "default_chat"
+        user = str(user_id or "").strip() or "default_user"
+        return f"{chat}::{user}"
+
+    def _get_or_create_engine(self, session_key: str) -> Optional[ChatEngine]:
+        if not (self._llm_enabled and self._openrouter_key):
+            return None
+
+        if self._engines is None:
+            self._engines = {}
+        if self._engine_pool_lock is None:
+            self._engine_pool_lock = threading.Lock()
+
+        with self._engine_pool_lock:
+            engine = self._engines.get(session_key)
+            if engine is not None:
+                return engine
+            engine = self._create_chat_engine()
+            self._engines[session_key] = engine
+            logger.info(f"[Agent] 创建会话引擎: session={session_key}")
+            return engine
+
+    def _get_session_dispatch_lock(self, session_key: str) -> threading.Lock:
+        if self._session_dispatch_locks is None:
+            self._session_dispatch_locks = {}
+        if self._engine_pool_lock is None:
+            self._engine_pool_lock = threading.Lock()
+
+        with self._engine_pool_lock:
+            lock = self._session_dispatch_locks.get(session_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_dispatch_locks[session_key] = lock
+            return lock
+
     def _create_chat_engine(self) -> ChatEngine:
         model_chain = self._get_ai_model_chain()
         engine = ChatEngine(
@@ -198,9 +255,151 @@ class FeishuBot(_PluginBase):
         return engine
 
     def _get_ai_status_model(self) -> str:
-        if self._engine:
-            return self._engine.resolved_model_name
+        if self._engines:
+            for engine in self._engines.values():
+                return engine.resolved_model_name
         return self._get_ai_model_chain()[0]
+
+    @classmethod
+    def _is_direct_confirm_text(cls, text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        return normalized in cls._DIRECT_CONFIRM_TEXTS
+
+    @classmethod
+    def _is_direct_cancel_text(cls, text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        return normalized in cls._DIRECT_CANCEL_TEXTS
+
+    def _cleanup_stale_sessions(self):
+        if not self._engines or self._engine_pool_lock is None:
+            return
+
+        stale_keys = []
+        with self._engine_pool_lock:
+            for session_key, engine in list(self._engines.items()):
+                running = bool(self._session_running.get(session_key)) if self._session_running else False
+                if running:
+                    continue
+                if engine.history.is_stale(self._SESSION_TTL_SECONDS):
+                    stale_keys.append(session_key)
+
+            for session_key in stale_keys:
+                engine = self._engines.pop(session_key, None)
+                if engine is not None:
+                    try:
+                        engine.reset()
+                    except Exception:
+                        pass
+                if self._session_running is not None:
+                    self._session_running.pop(session_key, None)
+                if self._session_dispatch_locks is not None:
+                    self._session_dispatch_locks.pop(session_key, None)
+
+        if stale_keys:
+            logger.info(f"[Agent] 已清理过期会话: {len(stale_keys)}")
+
+    def _cleanup_recent_actions(self):
+        if self._recent_actions is None or self._recent_actions_lock is None:
+            return
+
+        cutoff = _time.monotonic() - self._ACTION_DEDUPE_TTL_SECONDS
+        with self._recent_actions_lock:
+            expired = [key for key, ts in self._recent_actions.items() if ts < cutoff]
+            for key in expired:
+                self._recent_actions.pop(key, None)
+
+    def _mark_action_once(self, action_key: str) -> bool:
+        if not action_key:
+            return False
+        if self._recent_actions is None:
+            self._recent_actions = {}
+        if self._recent_actions_lock is None:
+            self._recent_actions_lock = threading.Lock()
+
+        now = _time.monotonic()
+        cutoff = now - self._ACTION_DEDUPE_TTL_SECONDS
+        with self._recent_actions_lock:
+            expired = [key for key, ts in self._recent_actions.items() if ts < cutoff]
+            for key in expired:
+                self._recent_actions.pop(key, None)
+            if action_key in self._recent_actions:
+                return False
+            self._recent_actions[action_key] = now
+            return True
+
+    @staticmethod
+    def _build_trace_id(kind: str, session_key: str = "", message_id: str = "") -> str:
+        suffix = message_id or str(_time.time_ns())[-8:]
+        if session_key:
+            return f"{kind}:{session_key}:{suffix}"
+        return f"{kind}:{suffix}"
+
+    def _try_handle_direct_pending_action(
+        self,
+        text: str,
+        engine: Optional[ChatEngine],
+        chat_id: str,
+        msg_id: str,
+        session_key: str = "",
+    ) -> bool:
+        if not engine:
+            return False
+
+        pending = engine.state.pending_download
+        if not pending:
+            return False
+
+        normalized = str(text or "").strip()
+
+        if self._is_direct_confirm_text(normalized):
+            title = pending.get("title", "未知资源")
+            action_key = f"text_confirm::{session_key}::{pending.get('index', -1)}::{title}"
+            if not self._mark_action_once(action_key):
+                logger.info(f"[Agent] 忽略重复确认: session={session_key}, title={title}")
+                if self._feishu:
+                    self._feishu.send_card(
+                        chat_id,
+                        _CardBuilder.notify_card("📝 已受理", f"下载确认已在处理中: {title}", "grey"),
+                        reply_msg_id=msg_id,
+                    )
+                return True
+            engine.history.append({"role": "user", "content": normalized})
+            result = engine.executor.execute(
+                "download_resource",
+                {"index": -1, "confirmed": True},
+            )
+            message = "✅ 已确认下载"
+            if result.success and isinstance(result.data, dict):
+                message = result.data.get("message") or message
+            elif not result.success:
+                message = result.error or "下载失败"
+            engine.history.append({"role": "assistant", "content": message})
+            if self._feishu:
+                card = (
+                    _CardBuilder.notify_card("✅ 下载已添加", message, "green")
+                    if result.success
+                    else _CardBuilder.error_card(message)
+                )
+                self._feishu.send_card(chat_id, card, reply_msg_id=msg_id)
+            logger.info(f"[Agent] 直接确认待下载资源: session={session_key}, title={title}")
+            return True
+
+        if self._is_direct_cancel_text(normalized):
+            title = pending.get("title", "未知资源")
+            engine.history.append({"role": "user", "content": normalized})
+            engine.state.clear_download()
+            message = f"已取消下载确认: {title}"
+            engine.history.append({"role": "assistant", "content": message})
+            if self._feishu:
+                self._feishu.send_card(
+                    chat_id,
+                    _CardBuilder.notify_card("🛑 已取消", message, "grey"),
+                    reply_msg_id=msg_id,
+                )
+            logger.info(f"[Agent] 已取消待下载资源: session={session_key}, title={title}")
+            return True
+
+        return False
 
 
 
@@ -245,7 +444,12 @@ class FeishuBot(_PluginBase):
             )
 
         self._feishu = _FeishuAPI(self._app_id, self._app_secret)
-        self._engine = None
+        self._engines = {}
+        self._session_running = {}
+        self._session_dispatch_locks = {}
+        self._engine_pool_lock = threading.Lock()
+        self._recent_actions = {}
+        self._recent_actions_lock = threading.Lock()
         self._seen_msg_ids = {}
         self._init_ts = datetime.now()
         self._feishu_ok = False
@@ -278,14 +482,12 @@ class FeishuBot(_PluginBase):
 
         if self._llm_enabled and self._openrouter_key:
             try:
-                self._engine = self._create_chat_engine()
                 logger.info(
                     f"飞书 Agent 模式已启用 ✓ inst={id(self):#x}, "
-                    f"模型链: {' -> '.join(self._engine.model_chain)}"
+                    f"模型链: {' -> '.join(self._get_ai_model_chain())}"
                 )
             except Exception as e:
                 logger.error(f"飞书 Agent 初始化失败: {e}", exc_info=True)
-                self._engine = None
         elif self._llm_enabled:
             logger.warning("飞书 AI Agent 已启用但 API Key 未配置，回退到传统模式")
         else:
@@ -307,7 +509,7 @@ class FeishuBot(_PluginBase):
         logger.warning(
             f"飞书机器人 stop_service v{self.plugin_version} "
             f"inst={id(self):#x}, "
-            f"engine={'有' if self._engine else '无'}, "
+            f"engine={'有' if self._engines else '无'}, "
             f"feishu={'有' if self._feishu else '无'}, "
             f"ws_running={self._ws_running}, "
             f"msgs={getattr(self, '_msg_count', '?')}, "
@@ -317,9 +519,15 @@ class FeishuBot(_PluginBase):
 
         self._stop_ws_client()
 
-        if self._engine:
-            self._engine.reset()
-        self._engine = None
+        if self._engines:
+            for engine in self._engines.values():
+                engine.reset()
+        self._engines = None
+        self._session_running = None
+        self._session_dispatch_locks = None
+        self._engine_pool_lock = None
+        self._recent_actions = None
+        self._recent_actions_lock = None
         self._feishu = None
         self._seen_msg_ids = None
 
@@ -475,13 +683,26 @@ class FeishuBot(_PluginBase):
         if self._seen_msg_ids is None:
             self._seen_msg_ids = {}
 
+        if self._recent_actions is None:
+            self._recent_actions = {}
+            recovered.append("recent_actions")
+        if self._recent_actions_lock is None:
+            self._recent_actions_lock = threading.Lock()
+            recovered.append("recent_actions_lock")
+
         if self._llm_enabled and self._openrouter_key:
-            if self._engine is None:
-                try:
-                    self._engine = self._create_chat_engine()
-                    recovered.append("engine")
-                except Exception as e:
-                    logger.error(f"Agent ChatEngine 恢复失败: {e}")
+            if self._engines is None:
+                self._engines = {}
+                recovered.append("engines")
+            if self._session_running is None:
+                self._session_running = {}
+                recovered.append("session_running")
+            if self._session_dispatch_locks is None:
+                self._session_dispatch_locks = {}
+                recovered.append("session_dispatch_locks")
+            if self._engine_pool_lock is None:
+                self._engine_pool_lock = threading.Lock()
+                recovered.append("engine_pool_lock")
 
         if recovered:
             try:
@@ -541,6 +762,9 @@ class FeishuBot(_PluginBase):
 
     def _handle_message(self, event: dict):
         try:
+            self._cleanup_stale_sessions()
+            self._cleanup_recent_actions()
+
             msg = event.get("message", {})
             chat_id = msg.get("chat_id", "") or self._chat_id
             msg_id = msg.get("message_id", "")
@@ -588,19 +812,23 @@ class FeishuBot(_PluginBase):
             if not text:
                 return
 
-            is_agent = self._engine is not None
+            session_key = self._session_key(chat_id, user_id)
+            trace_id = self._build_trace_id("msg", session_key, msg_id)
+            engine = self._get_or_create_engine(session_key)
+            is_agent = engine is not None
             try:
                 self._msg_count = getattr(self, "_msg_count", 0) + 1
             except Exception:
                 pass
             logger.info(
                 f"飞书收到: v{self.plugin_version}, inst={id(self):#x}, "
-                f"msg#{self._msg_count}, user={user_id}, text={text[:80]}"
+                f"msg#{self._msg_count}, trace={trace_id}, session={session_key}, "
+                f"user={user_id}, text={text[:80]}"
             )
             logger.info(
                 f"飞书路由: agent={'ON' if is_agent else 'OFF'}, "
                 f"llm_enabled={self._llm_enabled}, "
-                f"engine={type(self._engine).__name__}"
+                f"engine={type(engine).__name__ if engine else 'None'}"
             )
 
             # ── 始终可用的指令 ──
@@ -609,8 +837,8 @@ class FeishuBot(_PluginBase):
                 return
 
             if text in ("/clear", "/清除", "清除对话", "重新开始"):
-                if self._engine:
-                    self._engine.reset()
+                if engine:
+                    engine.reset()
                 if self._feishu:
                     self._feishu.send_card(
                         chat_id,
@@ -623,34 +851,47 @@ class FeishuBot(_PluginBase):
                 self._cmd_help(chat_id, msg_id)
                 return
 
+            if self._try_handle_direct_pending_action(text, engine, chat_id, msg_id, session_key):
+                return
+
             # ── Agent 模式：并发安全的消息路由 ──
             if is_agent:
                 try:
                     self._agent_count = getattr(self, "_agent_count", 0) + 1
                 except Exception:
                     pass
-                logger.info(f"[Agent] 收到消息 (#{self._agent_count}): {text[:80]}")
+                logger.info(
+                    f"[Agent] 收到消息 (#{self._agent_count}, trace={trace_id}, session={session_key}): {text[:80]}"
+                )
 
-                if self._engine.is_busy:
-                    # ── 引擎忙碌：排队 + 通知用户，不创建新线程 ──
-                    self._engine.enqueue(text)
-                    logger.info(f"[Agent] 引擎忙碌，消息已排队: '{text[:40]}'")
-                    if self._feishu:
-                        self._feishu.send_card(
-                            chat_id,
-                            _CardBuilder.notify_card(
-                                "📝 已收到",
-                                f"正在处理上一条消息，你的新消息「{text[:30]}」排队中，稍后自动处理。",
-                                "blue",
-                            ),
-                            reply_msg_id=msg_id,
-                        )
-                    return  # ← 不创建新线程！当前线程处理完后会自动消费排队消息
+                dispatch_lock = self._get_session_dispatch_lock(session_key)
+                with dispatch_lock:
+                    running = bool(self._session_running.get(session_key)) if self._session_running else False
+                    if running:
+                        engine.enqueue({
+                            "text": text,
+                            "chat_id": chat_id,
+                            "msg_id": msg_id,
+                        })
+                        logger.info(f"[Agent] 会话忙碌，消息已排队: session={session_key}, text='{text[:40]}'")
+                        if self._feishu:
+                            self._feishu.send_card(
+                                chat_id,
+                                _CardBuilder.notify_card(
+                                    "📝 已收到",
+                                    f"正在处理上一条消息，你的新消息「{text[:30]}」排队中，稍后自动处理。",
+                                    "blue",
+                                ),
+                                reply_msg_id=msg_id,
+                            )
+                        return
 
-                # ── 引擎空闲：正常启动 ──
+                    if self._session_running is not None:
+                        self._session_running[session_key] = True
+
                 threading.Thread(
                     target=self._agent_handle_v2,
-                    args=(text, chat_id, msg_id),
+                    args=(session_key, text, chat_id, msg_id),
                     daemon=True,
                 ).start()
                 return
@@ -669,7 +910,7 @@ class FeishuBot(_PluginBase):
     #  Agent 处理 (v6.0.0 — ChatEngine 集成)
     # ══════════════════════════════════════════════════════════════════════
 
-    def _agent_handle_v2(self, text: str, chat_id: str, msg_id: str):
+    def _agent_handle_v2(self, session_key: str, text: str, chat_id: str, msg_id: str):
         """
         Agent 处理方法 — 使用 ChatEngine，内置排队消费循环。
 
@@ -678,6 +919,16 @@ class FeishuBot(_PluginBase):
         2. 处理完成后检查排队消息，在同一个线程中继续处理（不创建新线程）
         3. 连续多条消息不会产生并发冲突
         """
+        engine = self._get_or_create_engine(session_key)
+        trace_id = self._build_trace_id("agent", session_key, msg_id)
+        if engine is None:
+            logger.error(f"[Agent] 会话引擎不可用: trace={trace_id}, session={session_key}")
+            dispatch_lock = self._get_session_dispatch_lock(session_key)
+            with dispatch_lock:
+                if self._session_running is not None:
+                    self._session_running[session_key] = False
+            return
+
         while True:  # ← 排队消费循环
             _t0 = _time.monotonic()
 
@@ -710,7 +961,7 @@ class FeishuBot(_PluginBase):
                             pass
 
                 # ══ 核心: engine 内部有锁，线程安全 ══
-                reply, steps = self._engine.chat_with_progress(
+                reply, steps = engine.chat_with_progress(
                     text,
                     on_tool_start=on_tool_start,
                 )
@@ -739,18 +990,24 @@ class FeishuBot(_PluginBase):
                     self._feishu.send_card(chat_id, error_card)
             finally:
                 _elapsed = _time.monotonic() - _t0
-                logger.info(f"[Agent] 完成: elapsed={_elapsed:.1f}s")
+                logger.info(f"[Agent] 完成: trace={trace_id}, session={session_key}, elapsed={_elapsed:.1f}s")
 
             # ════════════════════════════════════════════════════════
             #  排队消费：检查是否有新消息在处理期间到达
             # ════════════════════════════════════════════════════════
-            pending = self._engine.drain_pending()
-            if pending is None:
-                break  # 没有排队消息 → 结束
-            logger.info(f"[Agent] 消费排队消息: '{pending[:50]}'")
-            text = pending
-            msg_id = ""  # 排队消息不 reply 原消息
-            # continue → 回到 while 循环顶部处理下一条
+            dispatch_lock = self._get_session_dispatch_lock(session_key)
+            with dispatch_lock:
+                pending = engine.drain_pending()
+                if pending is None:
+                    if self._session_running is not None:
+                        self._session_running[session_key] = False
+                    break
+
+            text = pending.get("text", "") or ""
+            chat_id = pending.get("chat_id", "") or chat_id
+            msg_id = pending.get("msg_id", "") or ""
+            trace_id = self._build_trace_id("agent", session_key, msg_id)
+            logger.info(f"[Agent] 消费排队消息: trace={trace_id}, session={session_key}, text='{text[:50]}'")
 
     # ══════════════════════════════════════════════════════════════════════
     # ══════════════════════════════════════════════════════════════════════
@@ -799,14 +1056,20 @@ class FeishuBot(_PluginBase):
         except Exception as e:
             return {"error": str(e)}
 
-    def _legacy_tool_download_resource(self, index: int, confirmed: bool = False) -> dict:
+    def _legacy_tool_download_resource(
+        self,
+        index: int,
+        confirmed: bool = False,
+        session_key: str = "",
+    ) -> dict:
         """传统模式: 下载资源"""
         try:
             from app.chain.search import SearchChain
             from app.chain.download import DownloadChain
             # 需要 engine 的 state 来获取 resource_cache
-            if self._engine and self._engine.state.resource_cache:
-                cache = self._engine.state.resource_cache
+            engine = self._get_or_create_engine(session_key) if session_key else None
+            if engine and engine.state.resource_cache:
+                cache = engine.state.resource_cache
             else:
                 return {"error": "没有可用的资源缓存，请先搜索资源"}
             if index < 0 or index >= len(cache):
@@ -825,14 +1088,20 @@ class FeishuBot(_PluginBase):
         except Exception as e:
             return {"error": str(e)}
 
-    def _legacy_tool_subscribe_media(self, keyword: str = None, idx: int = None) -> dict:
+    def _legacy_tool_subscribe_media(
+        self,
+        keyword: str = None,
+        idx: int = None,
+        session_key: str = "",
+    ) -> dict:
         """传统模式: 订阅"""
         try:
             from app.chain.search import SearchChain
             from app.chain.subscribe import SubscribeChain
             from app.chain.media import MediaChain
-            if idx is not None and self._engine and self._engine.state.search_cache:
-                cache = self._engine.state.search_cache
+            engine = self._get_or_create_engine(session_key) if session_key else None
+            if idx is not None and engine and engine.state.search_cache:
+                cache = engine.state.search_cache
                 if 0 <= idx < len(cache):
                     item = cache[idx]
                     info = MediaChain().recognize_media(meta=item)
@@ -973,7 +1242,7 @@ class FeishuBot(_PluginBase):
                 ws_status = "❌ 未运行"
 
         agent_status = "❌ 未激活"
-        if self._engine:
+        if self._engines:
             agent_status = "✅ 运行中"
         elif self._llm_enabled:
             agent_status = "⚠️ 已启用未激活"
@@ -991,6 +1260,7 @@ class FeishuBot(_PluginBase):
             "agent_count": getattr(self, "_agent_count", 0),
             "legacy_count": getattr(self, "_legacy_count", 0),
             "recover_count": getattr(self, "_recover_count", 0),
+            "conversations": len(self._engines or {}),
             "cache_media": cache_media,
             "cache_res": cache_res,
         }
@@ -1001,7 +1271,7 @@ class FeishuBot(_PluginBase):
         )
 
     def _cmd_help(self, chat_id: str, msg_id: str):
-        agent_on = self._engine is not None
+        agent_on = bool(self._llm_enabled and self._openrouter_key)
         ws_on = self._use_ws and self._ws_running
         self._feishu.send_card(
             chat_id,
@@ -1015,6 +1285,7 @@ class FeishuBot(_PluginBase):
 
     def _handle_card_action(self, data: dict) -> dict:
         try:
+            self._cleanup_recent_actions()
             action = data.get("event", {}).get("action", {})
             value = action.get("value", {})
             act = value.get("action", "")
@@ -1022,6 +1293,13 @@ class FeishuBot(_PluginBase):
             user_id = operator.get("open_id", "")
             ctx = data.get("event", {}).get("context", {})
             chat_id = ctx.get("open_chat_id", "") or self._chat_id
+            session_key = self._session_key(chat_id, user_id)
+            callback_token = (
+                data.get("header", {}).get("event_id", "")
+                or data.get("event", {}).get("context", {}).get("open_message_id", "")
+            )
+            trace_id = self._build_trace_id("card", session_key, callback_token)
+            logger.info(f"[Card] 收到回调: trace={trace_id}, session={session_key}, action={act}")
 
             if act == "download_resource":
                 idx = int(value.get("index", 0))
@@ -1030,11 +1308,19 @@ class FeishuBot(_PluginBase):
                 ).start()
             elif act == "download_resource_confirm":
                 idx = int(value.get("index", 0))
+                action_key = f"card_confirm::{session_key}::{idx}"
+                if not self._mark_action_once(action_key):
+                    logger.info(f"[Card] 忽略重复下载确认: trace={trace_id}, session={session_key}, index={idx}")
+                    return {"code": 0}
                 threading.Thread(
                     target=self._card_download_confirmed, args=(idx, user_id, chat_id), daemon=True,
                 ).start()
             elif act == "subscribe":
                 idx = int(value.get("index", 0))
+                action_key = f"card_subscribe::{session_key}::{idx}"
+                if not self._mark_action_once(action_key):
+                    logger.info(f"[Card] 忽略重复订阅: trace={trace_id}, session={session_key}, index={idx}")
+                    return {"code": 0}
                 threading.Thread(
                     target=self._card_subscribe, args=(idx, user_id, chat_id), daemon=True,
                 ).start()
@@ -1051,7 +1337,8 @@ class FeishuBot(_PluginBase):
 
     def _card_download(self, idx: int, user_id: str, chat_id: str):
         """卡片按钮: 展示下载确认"""
-        result = self._legacy_tool_download_resource(idx, confirmed=False)
+        session_key = self._session_key(chat_id, user_id)
+        result = self._legacy_tool_download_resource(idx, confirmed=False, session_key=session_key)
         if result.get("error"):
             self._feishu.send_card(chat_id, _CardBuilder.error_card(result["error"]))
             return
@@ -1068,7 +1355,8 @@ class FeishuBot(_PluginBase):
 
     def _card_download_confirmed(self, idx: int, user_id: str, chat_id: str):
         """卡片按钮: 确认下载"""
-        result = self._legacy_tool_download_resource(idx, confirmed=True)
+        session_key = self._session_key(chat_id, user_id)
+        result = self._legacy_tool_download_resource(idx, confirmed=True, session_key=session_key)
         msg = result.get("message") or result.get("error", "操作失败")
         if result.get("success"):
             self._feishu.send_card(
@@ -1079,7 +1367,8 @@ class FeishuBot(_PluginBase):
             self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
 
     def _card_subscribe(self, idx: int, user_id: str, chat_id: str):
-        result = self._legacy_tool_subscribe_media(None, idx=idx)
+        session_key = self._session_key(chat_id, user_id)
+        result = self._legacy_tool_subscribe_media(None, idx=idx, session_key=session_key)
         msg = result.get("message") or result.get("error", "操作失败")
         if result.get("success"):
             self._feishu.send_card(
@@ -1239,7 +1528,7 @@ class FeishuBot(_PluginBase):
                 uptime = f"{hours}h {mins}m {secs}s"
 
             feishu_ok = getattr(self, "_feishu_ok", False)
-            agent_active = self._engine is not None
+            agent_active = bool(self._llm_enabled and self._openrouter_key)
             model = self._get_ai_status_model()
 
             ws_status = "未启用"
