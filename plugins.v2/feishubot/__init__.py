@@ -1,6 +1,9 @@
 """
-飞书机器人插件 v6.0.3 — ChatEngine 重构 + WebSocket 长连接
+飞书机器人插件 v6.0.4 — ChatEngine 重构 + WebSocket 长连接
 
+更新记录 (v6.0.4):
+- **单线程处理修复**: 机器人改为全局单线程处理，处理中的新消息仅回复 `⏳` 并直接丢弃，避免排队后延迟再次回复
+- **Token 获取修复**: 补充 `timedelta` 导入，修复飞书 Token 获取时报 `name 'timedelta' is not defined`
 更新记录 (v6.0.3):
 - **免费模型兼容修复**: 下线的 `qwen/qwen3-4b:free` 自动迁移到当前可用的免费 Qwen 模型，避免历史配置持续 404
 - **后备模型增强**: 默认免费模型池替换为当前更稳定的候选，并新增 NVIDIA 免费模型作为额外兜底
@@ -133,7 +136,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "6.0.3"
+    plugin_version = "6.0.4"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -163,6 +166,8 @@ class FeishuBot(_PluginBase):
     _recent_actions: Optional[dict] = None
     _recent_actions_lock: Optional[threading.Lock] = None
     _seen_msg_ids: Optional[dict] = None         # msg_id -> timestamp (消息去重)
+    _global_processing_lock: Optional[threading.Lock] = None
+    _global_processing: bool = False
 
     # ── WebSocket 长连接运行时 ──
     _ws_client: Optional[Any] = None
@@ -460,6 +465,8 @@ class FeishuBot(_PluginBase):
         self._recent_actions = {}
         self._recent_actions_lock = threading.Lock()
         self._seen_msg_ids = {}
+        self._global_processing_lock = threading.Lock()
+        self._global_processing = False
         self._init_ts = datetime.now()
         self._feishu_ok = False
         self._msg_count = 0
@@ -539,6 +546,8 @@ class FeishuBot(_PluginBase):
         self._recent_actions_lock = None
         self._feishu = None
         self._seen_msg_ids = None
+        self._global_processing_lock = None
+        self._global_processing = False
 
     # ══════════════════════════════════════════════════════════════════════
     #  WebSocket 长连接管理
@@ -698,6 +707,9 @@ class FeishuBot(_PluginBase):
         if self._recent_actions_lock is None:
             self._recent_actions_lock = threading.Lock()
             recovered.append("recent_actions_lock")
+        if self._global_processing_lock is None:
+            self._global_processing_lock = threading.Lock()
+            recovered.append("global_processing_lock")
 
         if self._llm_enabled and self._openrouter_key:
             if self._engines is None:
@@ -721,6 +733,33 @@ class FeishuBot(_PluginBase):
             logger.warning(
                 f"飞书运行时对象已自动恢复 (第{self._recover_count}次): "
                 f"inst={id(self):#x}, {recovered}"
+            )
+
+    def _try_acquire_global_processing(self, session_key: str, msg_id: str) -> bool:
+        if self._global_processing_lock is None:
+            self._global_processing_lock = threading.Lock()
+
+        with self._global_processing_lock:
+            if self._global_processing:
+                logger.info(
+                    f"[Busy] 丢弃新消息: session={session_key}, msg_id={msg_id or '-'}"
+                )
+                return False
+            self._global_processing = True
+            logger.info(
+                f"[Busy] 开始处理: session={session_key}, msg_id={msg_id or '-'}"
+            )
+            return True
+
+    def _release_global_processing(self, session_key: str = "", msg_id: str = ""):
+        if self._global_processing_lock is None:
+            self._global_processing = False
+            return
+
+        with self._global_processing_lock:
+            self._global_processing = False
+            logger.info(
+                f"[Busy] 结束处理: session={session_key or '-'}, msg_id={msg_id or '-'}"
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -840,6 +879,13 @@ class FeishuBot(_PluginBase):
                 f"engine={type(engine).__name__ if engine else 'None'}"
             )
 
+            if not self._try_acquire_global_processing(session_key, msg_id):
+                if self._feishu:
+                    self._feishu.send_text(chat_id, "⏳", reply_msg_id=msg_id)
+                return
+
+            release_after_handle = True
+
             # ── 始终可用的指令 ──
             if text.startswith("/status") or text.startswith("/状态"):
                 self._cmd_status(chat_id, msg_id)
@@ -873,31 +919,7 @@ class FeishuBot(_PluginBase):
                     f"[Agent] 收到消息 (#{self._agent_count}, trace={trace_id}, session={session_key}): {text[:80]}"
                 )
 
-                dispatch_lock = self._get_session_dispatch_lock(session_key)
-                with dispatch_lock:
-                    running = bool(self._session_running.get(session_key)) if self._session_running else False
-                    if running:
-                        engine.enqueue({
-                            "text": text,
-                            "chat_id": chat_id,
-                            "msg_id": msg_id,
-                        })
-                        logger.info(f"[Agent] 会话忙碌，消息已排队: session={session_key}, text='{text[:40]}'")
-                        if self._feishu:
-                            self._feishu.send_card(
-                                chat_id,
-                                _CardBuilder.notify_card(
-                                    "📝 已收到",
-                                    f"正在处理上一条消息，你的新消息「{text[:30]}」排队中，稍后自动处理。",
-                                    "blue",
-                                ),
-                                reply_msg_id=msg_id,
-                            )
-                        return
-
-                    if self._session_running is not None:
-                        self._session_running[session_key] = True
-
+                release_after_handle = False
                 threading.Thread(
                     target=self._agent_handle_v2,
                     args=(session_key, text, chat_id, msg_id),
@@ -914,6 +936,12 @@ class FeishuBot(_PluginBase):
             self._legacy_handle(text, chat_id, msg_id, user_id)
         except Exception as _exc:
             logger.error(f"_handle_message 顶层异常: {_exc}", exc_info=True)
+        finally:
+            if locals().get("release_after_handle"):
+                self._release_global_processing(
+                    locals().get("session_key", ""),
+                    locals().get("msg_id", ""),
+                )
 
     # ══════════════════════════════════════════════════════════════════════
     #  Agent 处理 (v6.0.0 — ChatEngine 集成)
@@ -921,102 +949,75 @@ class FeishuBot(_PluginBase):
 
     def _agent_handle_v2(self, session_key: str, text: str, chat_id: str, msg_id: str):
         """
-        Agent 处理方法 — 使用 ChatEngine，内置排队消费循环。
-
-        设计:
-        1. engine.chat_with_progress() 内部有锁，保证同一时间只有一个在运行
-        2. 处理完成后检查排队消息，在同一个线程中继续处理（不创建新线程）
-        3. 连续多条消息不会产生并发冲突
+        Agent 处理方法 — 全局单线程模式。
         """
         engine = self._get_or_create_engine(session_key)
         trace_id = self._build_trace_id("agent", session_key, msg_id)
         if engine is None:
             logger.error(f"[Agent] 会话引擎不可用: trace={trace_id}, session={session_key}")
-            dispatch_lock = self._get_session_dispatch_lock(session_key)
-            with dispatch_lock:
-                if self._session_running is not None:
-                    self._session_running[session_key] = False
+            self._release_global_processing(session_key, msg_id)
             return
 
-        while True:  # ← 排队消费循环
-            _t0 = _time.monotonic()
+        _t0 = _time.monotonic()
 
-            # ── 即时反馈 ──
-            processing_card = _CardBuilder.processing_card(text)
-            send_result = self._feishu.send_card(
-                chat_id, processing_card, reply_msg_id=msg_id
+        # ── 即时反馈 ──
+        processing_card = _CardBuilder.processing_card(text)
+        send_result = self._feishu.send_card(
+            chat_id, processing_card, reply_msg_id=msg_id
+        )
+        status_msg_id = ""
+        try:
+            status_msg_id = send_result.get("data", {}).get("message_id", "")
+        except Exception:
+            pass
+
+        try:
+            # ── 进度回调 ──
+            step_log_display = []
+
+            def on_tool_start(tool_name: str, tool_args: dict):
+                from .ai.tools import friendly_tool_name
+                friendly = friendly_tool_name(tool_name, tool_args)
+                step_log_display.append(friendly)
+                if status_msg_id and self._feishu:
+                    try:
+                        progress_card = _CardBuilder.agent_tool_progress_card(
+                            text, step_log_display[:-1], step_log_display[-1]
+                        )
+                        self._feishu.update_card(status_msg_id, progress_card)
+                    except Exception:
+                        pass
+
+            reply, steps = engine.chat_with_progress(
+                text,
+                on_tool_start=on_tool_start,
             )
-            status_msg_id = ""
-            try:
-                status_msg_id = send_result.get("data", {}).get("message_id", "")
-            except Exception:
-                pass
 
-            try:
-                # ── 进度回调 ──
-                step_log_display = []
-
-                def on_tool_start(tool_name: str, tool_args: dict):
-                    from .ai.tools import friendly_tool_name
-                    friendly = friendly_tool_name(tool_name, tool_args)
-                    step_log_display.append(friendly)
-                    if status_msg_id and self._feishu:
-                        try:
-                            progress_card = _CardBuilder.agent_tool_progress_card(
-                                text, step_log_display[:-1], step_log_display[-1]
-                            )
-                            self._feishu.update_card(status_msg_id, progress_card)
-                        except Exception:
-                            pass
-
-                # ══ 核心: engine 内部有锁，线程安全 ══
-                reply, steps = engine.chat_with_progress(
-                    text,
-                    on_tool_start=on_tool_start,
-                )
-
-                # ── 发送最终回复 ──
-                elapsed = _time.monotonic() - _t0
-                if reply:
-                    final_card = _CardBuilder.agent_reply_card(reply, elapsed)
-                    if status_msg_id:
-                        self._feishu.update_card(status_msg_id, final_card)
-                    else:
-                        self._feishu.send_card(chat_id, final_card, reply_msg_id=msg_id)
+            elapsed = _time.monotonic() - _t0
+            if reply:
+                final_card = _CardBuilder.agent_reply_card(reply, elapsed)
+                if status_msg_id:
+                    self._feishu.update_card(status_msg_id, final_card)
                 else:
-                    error_card = _CardBuilder.error_card("AI 没有生成回复，请再试试~")
-                    if status_msg_id:
-                        self._feishu.update_card(status_msg_id, error_card)
-                    else:
-                        self._feishu.send_card(chat_id, error_card)
-
-            except Exception as e:
-                logger.error(f"Agent 异常: {e}", exc_info=True)
-                error_card = _CardBuilder.error_card(f"AI 处理出错: {e}")
+                    self._feishu.send_card(chat_id, final_card, reply_msg_id=msg_id)
+            else:
+                error_card = _CardBuilder.error_card("AI 没有生成回复，请再试试~")
                 if status_msg_id:
                     self._feishu.update_card(status_msg_id, error_card)
-                elif self._feishu:
+                else:
                     self._feishu.send_card(chat_id, error_card)
-            finally:
-                _elapsed = _time.monotonic() - _t0
-                logger.info(f"[Agent] 完成: trace={trace_id}, session={session_key}, elapsed={_elapsed:.1f}s")
 
-            # ════════════════════════════════════════════════════════
-            #  排队消费：检查是否有新消息在处理期间到达
-            # ════════════════════════════════════════════════════════
-            dispatch_lock = self._get_session_dispatch_lock(session_key)
-            with dispatch_lock:
-                pending = engine.drain_pending()
-                if pending is None:
-                    if self._session_running is not None:
-                        self._session_running[session_key] = False
-                    break
-
-            text = pending.get("text", "") or ""
-            chat_id = pending.get("chat_id", "") or chat_id
-            msg_id = pending.get("msg_id", "") or ""
-            trace_id = self._build_trace_id("agent", session_key, msg_id)
-            logger.info(f"[Agent] 消费排队消息: trace={trace_id}, session={session_key}, text='{text[:50]}'")
+        except Exception as e:
+            logger.error(f"Agent 异常: {e}", exc_info=True)
+            error_card = _CardBuilder.error_card(f"AI 处理出错: {e}")
+            if status_msg_id:
+                self._feishu.update_card(status_msg_id, error_card)
+            elif self._feishu:
+                self._feishu.send_card(chat_id, error_card)
+        finally:
+            _elapsed = _time.monotonic() - _t0
+            logger.info(f"[Agent] 完成: trace={trace_id}, session={session_key}, elapsed={_elapsed:.1f}s")
+            self._release_global_processing(session_key, msg_id)
 
     # ══════════════════════════════════════════════════════════════════════
     # ══════════════════════════════════════════════════════════════════════
