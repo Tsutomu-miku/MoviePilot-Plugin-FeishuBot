@@ -28,9 +28,14 @@ FREE_MODEL_CHOICES = [
         "desc": "中文和多语言对话都比较稳。",
     },
     {
-        "title": "Qwen 3 4B",
-        "value": "qwen/qwen3-4b:free",
-        "desc": "轻量免费模型，适合兜底。",
+        "title": "Qwen3 Next 80B A3B Instruct",
+        "value": "qwen/qwen3-next-80b-a3b-instruct:free",
+        "desc": "当前更稳定的免费 Qwen 选项，适合中文和多轮对话。",
+    },
+    {
+        "title": "NVIDIA Nemotron 3 Nano 30B A3B",
+        "value": "nvidia/nemotron-3-nano-30b-a3b:free",
+        "desc": "免费容量较稳定，适合作为额外后备模型。",
     },
 ]
 
@@ -39,8 +44,20 @@ DEFAULT_FALLBACK_MODELS = [
     "google/gemini-2.0-flash-exp:free",
     "stepfun/step-3.5-flash:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen3-4b:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
 ]
+
+MODEL_ALIASES = {
+    "qwen/qwen3-4b:free": "qwen/qwen3-next-80b-a3b-instruct:free",
+}
+
+
+def normalize_model_name(model: str) -> str:
+    value = str(model or "").strip()
+    if not value:
+        return ""
+    return MODEL_ALIASES.get(value, value)
 
 
 def _normalize_model_list(models: Optional[Iterable[str]]) -> List[str]:
@@ -50,7 +67,7 @@ def _normalize_model_list(models: Optional[Iterable[str]]) -> List[str]:
     normalized = []
     seen = set()
     for model in models:
-        value = str(model or "").strip()
+        value = normalize_model_name(model)
         if not value or value in seen:
             continue
         normalized.append(value)
@@ -79,7 +96,7 @@ class LLMClient:
         auto_fallback: bool = True,
     ):
         self.api_key = api_key
-        self.primary_model = str(model or self.DEFAULT_MODEL).strip() or self.DEFAULT_MODEL
+        self.primary_model = normalize_model_name(model) or self.DEFAULT_MODEL
         self.base_url = base_url or self.DEFAULT_BASE_URL
         self.auto_fallback = bool(auto_fallback)
         self.fallback_models = _normalize_model_list(fallback_models)
@@ -87,6 +104,10 @@ class LLMClient:
         self.model = self.primary_model
         self.last_used_model = self.primary_model
         self.last_resolved_model = self.primary_model
+        if str(model or "").strip() and self.primary_model != str(model).strip():
+            logger.warning(
+                f"LLM 模型别名已重写: {str(model).strip()} -> {self.primary_model}"
+            )
 
     @classmethod
     def free_model_options(cls) -> List[dict]:
@@ -187,6 +208,8 @@ class LLMClient:
             "unsupported model",
         )
         if status_code in {408, 409, 429} or status_code >= 500:
+            return True
+        if status_code == 404:
             return True
         if any(keyword in lower for keyword in keywords):
             return True

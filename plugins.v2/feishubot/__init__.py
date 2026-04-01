@@ -1,6 +1,10 @@
 """
-飞书机器人插件 v6.0.2 — ChatEngine 重构 + WebSocket 长连接
+飞书机器人插件 v6.0.3 — ChatEngine 重构 + WebSocket 长连接
 
+更新记录 (v6.0.3):
+- **免费模型兼容修复**: 下线的 `qwen/qwen3-4b:free` 自动迁移到当前可用的免费 Qwen 模型，避免历史配置持续 404
+- **后备模型增强**: 默认免费模型池替换为当前更稳定的候选，并新增 NVIDIA 免费模型作为额外兜底
+- **降级逻辑放宽**: OpenRouter 返回 HTTP 404 时直接继续尝试后备模型，不再依赖错误文案是否包含 model 关键字
 更新记录 (v6.0.2):
 - **会话隔离修复**: ChatEngine 从全局单实例改为按 `chat_id + user_id` 维度隔离，避免确认消息串会话或上下文丢失
 - **队列与并发修复**: 同一会话使用 FIFO 消息队列 + dispatch lock + running 状态，避免旧会话与新消息并发回复
@@ -106,7 +110,12 @@ from .utils import _HAS_LARK_SDK, _extract_tags, lark, LarkWSClient, EventDispat
 from .feishu_api import _FeishuAPI
 from .card_builder import _CardBuilder
 from .ai import ChatEngine
-from .ai.llm import DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, FREE_MODEL_CHOICES
+from .ai.llm import (
+    DEFAULT_FALLBACK_MODELS,
+    DEFAULT_MODEL,
+    FREE_MODEL_CHOICES,
+    normalize_model_name,
+)
 
 
 class FeishuBot(_PluginBase):
@@ -124,7 +133,7 @@ class FeishuBot(_PluginBase):
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "6.0.2"
+    plugin_version = "6.0.3"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -192,16 +201,16 @@ class FeishuBot(_PluginBase):
         return result
 
     def _get_ai_model_chain(self) -> List[str]:
-        primary = str(
+        primary = normalize_model_name(
             self._openrouter_model or self._openrouter_free_model or DEFAULT_MODEL
-        ).strip() or DEFAULT_MODEL
+        ) or DEFAULT_MODEL
         fallback_models = self._parse_str_list_config(self._openrouter_fallback_models)
         if not fallback_models and self._openrouter_auto_fallback:
             fallback_models = list(DEFAULT_FALLBACK_MODELS)
 
         chain = []
         for model in [primary] + fallback_models:
-            model = str(model or "").strip()
+            model = normalize_model_name(model)
             if model and model not in chain:
                 chain.append(model)
         return chain or [DEFAULT_MODEL]
