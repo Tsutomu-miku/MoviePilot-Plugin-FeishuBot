@@ -185,6 +185,8 @@ Agent 模式下，用户通过自然语言完成「搜索 → 选择 → 确认�
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
+| v6.0.7 | 修复 Agent 进度回调导入路径错误：`routing.py` 中将错误的 `mixins.ai` 相对导入改为上级 `ai` 子包，解决 `No module named 'app.plugins.feishubot.mixins.ai'` |
+| v6.0.6 | 增强兼容性与回归保障：飞书 Token 获取新增响应校验与过期时间兜底，避免旧环境因异常 `expire` 值或错误响应导致取 Token 失败；同时补充免费模型别名 / Token 缓存回归测试 |
 | v6.0.5 | 修复单用户场景下的重复回复与上下文丢失：统一 direct reply / 引用回复 / 卡片按钮到单一会话上下文，新增 `下载11号` / `订阅2` 等序号直达状态机，并为 `message_id` 去重增加线程锁 |
 | v6.0.4 | 修复机器人并发与 Token 获取问题：处理中的新消息仅回复 `⏳` 并直接丢弃，避免排队后延迟再次回复；同时补充 `timedelta` 导入，修复获取飞书 Token 时 `name 'timedelta' is not defined` |
 | v6.0.3 | 修复免费模型 `qwen/qwen3-4b:free` 下线后的 HTTP 404 问题：自动迁移到当前可用的免费 Qwen 模型，更新默认后备模型池，并在 OpenRouter 返回 404 时继续尝试后备模型 |

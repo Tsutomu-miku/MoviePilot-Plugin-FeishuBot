@@ -175,7 +175,7 @@ class FeishuRoutingMixin:
                 step_log_display = []
 
                 def on_tool_start(tool_name: str, tool_args: dict):
-                    from .ai.tools import friendly_tool_name
+                    from ..ai.tools import friendly_tool_name
                     friendly = friendly_tool_name(tool_name, tool_args)
                     step_log_display.append(friendly)
                     if status_msg_id and self._feishu:

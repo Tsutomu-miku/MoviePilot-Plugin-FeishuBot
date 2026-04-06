@@ -16,6 +16,14 @@ class _FeishuAPI:
         self._token: str = ""
         self._token_expire: datetime = datetime.min
 
+    @staticmethod
+    def _token_ttl_seconds(expire_value) -> int:
+        try:
+            expire_seconds = int(expire_value)
+        except (TypeError, ValueError):
+            expire_seconds = 7200
+        return max(expire_seconds - 60, 60)
+
     def _get_token(self) -> str:
         if self._token and datetime.now() < self._token_expire:
             return self._token
@@ -25,10 +33,20 @@ class _FeishuAPI:
                 json={"app_id": self._app_id, "app_secret": self._app_secret},
                 timeout=10,
             )
+            resp.raise_for_status()
             data = resp.json()
-            self._token = data.get("tenant_access_token", "")
+            if data.get("code", 0) != 0:
+                raise RuntimeError(
+                    f"code={data.get('code')} msg={data.get('msg') or data.get('message') or 'unknown error'}"
+                )
+
+            token = data.get("tenant_access_token", "")
+            if not token:
+                raise RuntimeError("tenant_access_token missing in response")
+
+            self._token = token
             self._token_expire = datetime.now() + timedelta(
-                seconds=data.get("expire", 7200) - 60
+                seconds=self._token_ttl_seconds(data.get("expire"))
             )
         except Exception as e:
             logger.error(f"获取飞书 Token 失败: {e}")

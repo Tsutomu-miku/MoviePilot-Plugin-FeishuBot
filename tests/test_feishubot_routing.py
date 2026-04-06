@@ -82,6 +82,8 @@ def _load_feishubot_module():
 
 PLUGIN_MODULE = _load_feishubot_module()
 STATE_MODULE = importlib.import_module(f"{PLUGIN_MODULE.__name__}.state")
+LLM_MODULE = importlib.import_module(f"{PLUGIN_MODULE.__name__}.ai.llm")
+FEISHU_API_MODULE = importlib.import_module(f"{PLUGIN_MODULE.__name__}.feishu_api")
 FeishuBot = PLUGIN_MODULE.FeishuBot
 
 
@@ -137,12 +139,16 @@ class _FakeEngine:
 class _FakeFeishu:
     def __init__(self):
         self.calls = []
+        self.updated = []
 
     def send_card(self, chat_id, card, reply_msg_id=None):
         self.calls.append(
             {"chat_id": chat_id, "card": card, "reply_msg_id": reply_msg_id}
         )
         return {"data": {"message_id": "status_msg"}}
+
+    def update_card(self, message_id, card):
+        self.updated.append({"message_id": message_id, "card": card})
 
 
 class FeishuBotRoutingTests(unittest.TestCase):
@@ -336,6 +342,74 @@ class FeishuBotRoutingTests(unittest.TestCase):
             "⬇️ 下载确认",
         )
         self.assertEqual(bot._shared_state.pending_download["index"], 0)
+
+    def test_retired_qwen_free_model_is_normalized_in_model_chain(self):
+        self.assertEqual(
+            LLM_MODULE.normalize_model_name("qwen/qwen3-4b:free"),
+            "qwen/qwen3-next-80b-a3b-instruct:free",
+        )
+        client = LLM_MODULE.LLMClient(
+            api_key="test-key",
+            model="qwen/qwen3-4b:free",
+            fallback_models=["qwen/qwen3-4b:free", "openrouter/free"],
+            auto_fallback=False,
+        )
+        self.assertEqual(
+            client.model_chain,
+            ["qwen/qwen3-next-80b-a3b-instruct:free", "openrouter/free"],
+        )
+
+    def test_feishu_token_fetch_sets_cached_expiry(self):
+        class _FakeResponse:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "code": 0,
+                    "tenant_access_token": "tenant-token",
+                    "expire": "3600",
+                }
+
+        calls = []
+        original_post = FEISHU_API_MODULE.requests.post
+
+        def _fake_post(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _FakeResponse()
+
+        FEISHU_API_MODULE.requests.post = _fake_post
+        try:
+            api = FEISHU_API_MODULE._FeishuAPI("app-id", "app-secret")
+            self.assertEqual(api._get_token(), "tenant-token")
+            self.assertGreater(api._token_expire, FEISHU_API_MODULE.datetime.now())
+            self.assertEqual(api._get_token(), "tenant-token")
+            self.assertEqual(len(calls), 1)
+        finally:
+            FEISHU_API_MODULE.requests.post = original_post
+
+    def test_agent_progress_callback_imports_ai_tools_from_parent_package(self):
+        class _ProgressEngine:
+            @staticmethod
+            def chat_with_progress(text, on_tool_start=None):
+                if on_tool_start:
+                    on_tool_start("search_resources", {"keyword": text})
+                return "处理完成", ["搜索资源"]
+
+        bot = FeishuBot()
+        bot._feishu = _FakeFeishu()
+        bot._get_or_create_engine = lambda _session_key: _ProgressEngine()
+        bot._release_global_processing = lambda _session_key, _msg_id: None
+        bot._build_trace_id = lambda *_args: "trace"
+
+        bot._agent_handle_v2("single_user", "流浪地球", "chat-id", "msg-id")
+
+        self.assertEqual(len(bot._feishu.calls), 1)
+        self.assertGreaterEqual(len(bot._feishu.updated), 2)
+        self.assertEqual(bot._feishu.updated[0]["message_id"], "status_msg")
+        self.assertEqual(bot._feishu.updated[-1]["message_id"], "status_msg")
 
 
 if __name__ == "__main__":
