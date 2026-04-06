@@ -13,51 +13,72 @@ FREE_MODEL_CHOICES = [
         "desc": "自动挑选当前可用的免费模型，最适合作为默认入口。",
     },
     {
-        "title": "Google Gemini 2.0 Flash Experimental",
-        "value": "google/gemini-2.0-flash-exp:free",
-        "desc": "响应快，工具调用体验稳定。",
+        "title": "Qwen 3.6 Plus",
+        "value": "qwen/qwen3.6-plus:free",
+        "desc": "OpenRouter 当前最新可用的免费 Qwen 主力模型，工具调用和中文表现都很强。",
+    },
+    {
+        "title": "MiniMax M2.5",
+        "value": "minimax/minimax-m2.5:free",
+        "desc": "当前可用的免费通用模型，适合作为中文和多轮任务后备。",
     },
     {
         "title": "StepFun Step 3.5 Flash",
         "value": "stepfun/step-3.5-flash:free",
-        "desc": "长上下文能力不错，适合复杂指令。",
+        "desc": "长上下文能力不错，适合复杂指令和工具调用。",
     },
     {
-        "title": "Meta Llama 3.3 70B Instruct",
-        "value": "meta-llama/llama-3.3-70b-instruct:free",
-        "desc": "中文和多语言对话都比较稳。",
+        "title": "Z.ai GLM 4.5 Air",
+        "value": "z-ai/glm-4.5-air:free",
+        "desc": "当前可用的免费 GLM 模型，适合作为中文理解和工具调用后备。",
+    },
+    {
+        "title": "NVIDIA Nemotron 3 Super 120B A12B",
+        "value": "nvidia/nemotron-3-super-120b-a12b:free",
+        "desc": "新一代免费大模型后备，长上下文和通用能力更强。",
     },
     {
         "title": "Qwen3 Next 80B A3B Instruct",
         "value": "qwen/qwen3-next-80b-a3b-instruct:free",
-        "desc": "当前更稳定的免费 Qwen 选项，适合中文和多轮对话。",
+        "desc": "仍然可用的免费 Qwen 后备模型，适合中文和多轮对话。",
+    },
+    {
+        "title": "OpenAI gpt-oss-120b",
+        "value": "openai/gpt-oss-120b:free",
+        "desc": "当前可用的免费开源大模型，适合作为通用问答与工具调用后备。",
+    },
+    {
+        "title": "Meta Llama 3.3 70B Instruct",
+        "value": "meta-llama/llama-3.3-70b-instruct:free",
+        "desc": "多语言对话表现稳定，可作为老牌后备模型。",
     },
     {
         "title": "NVIDIA Nemotron 3 Nano 30B A3B",
         "value": "nvidia/nemotron-3-nano-30b-a3b:free",
         "desc": "免费容量较稳定，适合作为额外后备模型。",
     },
+    {
+        "title": "Arcee Trinity Large Preview",
+        "value": "arcee-ai/trinity-large-preview:free",
+        "desc": "当前可用的免费预览模型，可作为补充后备。",
+    },
 ]
 
 DEFAULT_MODEL = "openrouter/free"
 DEFAULT_FALLBACK_MODELS = [
-    "google/gemini-2.0-flash-exp:free",
+    "qwen/qwen3.6-plus:free",
+    "minimax/minimax-m2.5:free",
     "stepfun/step-3.5-flash:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
+    "z-ai/glm-4.5-air:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
     "qwen/qwen3-next-80b-a3b-instruct:free",
+    "openai/gpt-oss-120b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
 ]
 
-MODEL_ALIASES = {
-    "qwen/qwen3-4b:free": "qwen/qwen3-next-80b-a3b-instruct:free",
-}
-
-
 def normalize_model_name(model: str) -> str:
-    value = str(model or "").strip()
-    if not value:
-        return ""
-    return MODEL_ALIASES.get(value, value)
+    return str(model or "").strip()
 
 
 def _normalize_model_list(models: Optional[Iterable[str]]) -> List[str]:
@@ -104,10 +125,6 @@ class LLMClient:
         self.model = self.primary_model
         self.last_used_model = self.primary_model
         self.last_resolved_model = self.primary_model
-        if str(model or "").strip() and self.primary_model != str(model).strip():
-            logger.warning(
-                f"LLM 模型别名已重写: {str(model).strip()} -> {self.primary_model}"
-            )
 
     @classmethod
     def free_model_options(cls) -> List[dict]:

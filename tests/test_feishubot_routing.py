@@ -343,10 +343,10 @@ class FeishuBotRoutingTests(unittest.TestCase):
         )
         self.assertEqual(bot._shared_state.pending_download["index"], 0)
 
-    def test_retired_qwen_free_model_is_normalized_in_model_chain(self):
+    def test_model_chain_keeps_explicit_model_name_without_alias_rewrite(self):
         self.assertEqual(
             LLM_MODULE.normalize_model_name("qwen/qwen3-4b:free"),
-            "qwen/qwen3-next-80b-a3b-instruct:free",
+            "qwen/qwen3-4b:free",
         )
         client = LLM_MODULE.LLMClient(
             api_key="test-key",
@@ -356,7 +356,29 @@ class FeishuBotRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             client.model_chain,
-            ["qwen/qwen3-next-80b-a3b-instruct:free", "openrouter/free"],
+            ["qwen/qwen3-4b:free", "openrouter/free"],
+        )
+
+    def test_free_model_defaults_track_current_openrouter_choices(self):
+        option_values = [item["value"] for item in LLM_MODULE.FREE_MODEL_CHOICES]
+        self.assertIn("qwen/qwen3.6-plus:free", option_values)
+        self.assertIn("minimax/minimax-m2.5:free", option_values)
+        self.assertIn("z-ai/glm-4.5-air:free", option_values)
+        self.assertIn("nvidia/nemotron-3-super-120b-a12b:free", option_values)
+        self.assertIn("openai/gpt-oss-120b:free", option_values)
+        self.assertNotIn("google/gemini-2.0-flash-exp:free", option_values)
+        self.assertEqual(
+            LLM_MODULE.normalize_model_name("google/gemini-2.0-flash-exp:free"),
+            "google/gemini-2.0-flash-exp:free",
+        )
+        self.assertEqual(
+            LLM_MODULE.DEFAULT_FALLBACK_MODELS[:4],
+            [
+                "qwen/qwen3.6-plus:free",
+                "minimax/minimax-m2.5:free",
+                "stepfun/step-3.5-flash:free",
+                "z-ai/glm-4.5-air:free",
+            ],
         )
 
     def test_feishu_token_fetch_sets_cached_expiry(self):
@@ -410,6 +432,17 @@ class FeishuBotRoutingTests(unittest.TestCase):
         self.assertGreaterEqual(len(bot._feishu.updated), 2)
         self.assertEqual(bot._feishu.updated[0]["message_id"], "status_msg")
         self.assertEqual(bot._feishu.updated[-1]["message_id"], "status_msg")
+
+    def test_get_form_uses_current_free_model_defaults(self):
+        bot = FeishuBot()
+        _form, defaults = bot.get_form()
+
+        self.assertEqual(defaults["openrouter_free_model"], "openrouter/free")
+        self.assertIn("qwen/qwen3.6-plus:free", defaults["openrouter_fallback_models"])
+        self.assertNotIn(
+            "google/gemini-2.0-flash-exp:free",
+            defaults["openrouter_fallback_models"],
+        )
 
 
 if __name__ == "__main__":

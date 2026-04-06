@@ -8,7 +8,7 @@ from app.core.event import Event, eventmanager
 from app.log import logger
 from app.schemas.types import EventType
 
-from ..ai.llm import FREE_MODEL_CHOICES
+from ..ai.llm import DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, FREE_MODEL_CHOICES
 from ..card_builder import _CardBuilder
 from ..utils import _HAS_LARK_SDK
 

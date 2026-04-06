@@ -185,6 +185,8 @@ Agent 模式下，用户通过自然语言完成「搜索 → 选择 → 确认�
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
+| v6.0.9 | 移除免费模型别名兼容逻辑：不再把旧模型名自动重写到新模型，配置里填什么模型就按什么模型请求；当前可用免费模型列表和默认后备模型保持不变 |
+| v6.0.8 | 根据 OpenRouter 官方 `models` 接口更新免费模型列表：移除已退役的 `google/gemini-2.0-flash-exp:free`，新增当前可用的 `qwen/qwen3.6-plus:free`、`minimax/minimax-m2.5:free`、`z-ai/glm-4.5-air:free`、`nvidia/nemotron-3-super-120b-a12b:free`、`openai/gpt-oss-120b:free` 等，并同步更新默认后备模型与旧模型别名兼容 |
 | v6.0.7 | 修复 Agent 进度回调导入路径错误：`routing.py` 中将错误的 `mixins.ai` 相对导入改为上级 `ai` 子包，解决 `No module named 'app.plugins.feishubot.mixins.ai'` |
 | v6.0.6 | 增强兼容性与回归保障：飞书 Token 获取新增响应校验与过期时间兜底，避免旧环境因异常 `expire` 值或错误响应导致取 Token 失败；同时补充免费模型别名 / Token 缓存回归测试 |
 | v6.0.5 | 修复单用户场景下的重复回复与上下文丢失：统一 direct reply / 引用回复 / 卡片按钮到单一会话上下文，新增 `下载11号` / `订阅2` 等序号直达状态机，并为 `message_id` 去重增加线程锁 |

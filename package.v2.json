@@ -3,7 +3,7 @@
     "name": "飞书机器人",
     "description": "飞书机器人通知与交互插件，支持 Agent 智能对话模式",
     "labels": "消息通知",
-    "version": "6.0.7",
+    "version": "6.0.9",
     "icon": "",
     "author": "Tsutomu",
     "level": 1,
@@ -34,7 +34,9 @@
       "v6.0.4": "修复飞书单线程处理与 Token 获取异常：机器人处理中的新消息仅回复 ⏳ 并丢弃，避免延迟再次回复；同时补充 timedelta 导入，修复获取飞书 Token 时 name 'timedelta' is not defined",
       "v6.0.5": "修复单用户场景下的重复回复与上下文丢失：统一为单会话上下文，新增 下载11号/订阅2 等序号直达状态机，并为 message_id 去重增加线程锁",
       "v6.0.6": "增强兼容性与回归保障：飞书 Token 获取新增响应校验与过期时间兜底，避免旧环境因异常 expire 值或错误响应导致取 Token 失败；同时补充免费模型别名/Token 缓存回归测试",
-      "v6.0.7": "修复 Agent 进度回调导入路径错误：routing.py 中将错误的 mixins.ai 相对导入改为上级 ai 子包，解决 No module named 'app.plugins.feishubot.mixins.ai'"
+      "v6.0.7": "修复 Agent 进度回调导入路径错误：routing.py 中将错误的 mixins.ai 相对导入改为上级 ai 子包，解决 No module named 'app.plugins.feishubot.mixins.ai'",
+      "v6.0.8": "根据 OpenRouter 官方 models 接口更新免费模型列表：移除已退役的 Gemini 2.0 Flash Experimental，新增当前可用的 Qwen 3.6 Plus、MiniMax M2.5、GLM 4.5 Air、Nemotron 3 Super、gpt-oss-120b 等免费模型，并同步更新默认后备模型与旧模型别名兼容",
+      "v6.0.9": "移除免费模型别名兼容逻辑：不再把旧模型名自动重写到新模型，配置中填写什么模型就按什么模型请求；当前可用免费模型列表和默认后备模型保持不变"
     }
   }
 }
