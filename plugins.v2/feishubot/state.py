@@ -22,9 +22,9 @@ def sync_state_cache(
     resource_cache=None,
 ) -> ChatState:
     if search_cache is not None:
-        state.search_cache = search_cache
+        state.replace_media(search_cache)
     if resource_cache is not None:
-        state.resource_cache = resource_cache
+        state.replace_resources(resource_cache)
     return state
 
 

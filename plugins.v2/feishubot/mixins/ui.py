@@ -8,7 +8,6 @@ from app.core.event import Event, eventmanager
 from app.log import logger
 from app.schemas.types import EventType
 
-from ..ai.llm import DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, FREE_MODEL_CHOICES
 from ..card_builder import _CardBuilder
 from ..utils import _HAS_LARK_SDK
 
@@ -20,10 +19,6 @@ class FeishuUIMixin:
                 {"title": "资源下载", "value": "download"},
                 {"title": "订阅", "value": "subscribe"},
                 {"title": "站点消息", "value": "site"},
-            ]
-            FreeModelOptions = [
-                {"title": item["title"], "value": item["value"]}
-                for item in FREE_MODEL_CHOICES
             ]
             return [
                 {
@@ -81,27 +76,13 @@ class FeishuUIMixin:
                                 {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
                                     {"component": "VTextField", "props": {"model": "openrouter_key", "label": "OpenRouter API Key", "placeholder": "sk-or-v1-..."}},
                                 ]},
-                                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                                    {"component": "VSwitch", "props": {"model": "openrouter_auto_fallback", "label": "自动切换后备免费模型"}},
-                                ]},
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                    {"component": "VSelect", "props": {"model": "openrouter_free_model", "label": "免费主模型", "items": FreeModelOptions}},
-                                ]},
-                                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                    {"component": "VSelect", "props": {"model": "openrouter_fallback_models", "label": "免费后备模型", "multiple": True, "chips": True, "items": FreeModelOptions}},
-                                ]},
                             ],
                         },
                         {
                             "component": "VRow",
                             "content": [
                                 {"component": "VCol", "props": {"cols": 12}, "content": [
-                                    {"component": "VTextField", "props": {"model": "openrouter_model", "label": "自定义模型（可选，优先于免费主模型）", "placeholder": "例如：openai/gpt-4o-mini；留空则走免费主模型"}},
+                                    {"component": "VTextField", "props": {"model": "openrouter_model", "label": "模型名称", "placeholder": "填写 OpenRouter 模型 ID"}},
                                 ]},
                             ],
                         },
@@ -112,7 +93,7 @@ class FeishuUIMixin:
                                     "type": "info", "variant": "tonal",
                                     "text": (
                                         "AI Agent 的实际能力是：理解自然语言、搜索影视、按偏好筛选资源、二次确认下载、订阅和查询下载进度。\n"
-                                        "默认推荐 OpenRouter 免费路由；当具体免费模型限流、下线或无可用 provider 时，会自动切换到后备模型。\n"
+                                        "只调用配置的模型，不自动选择或切换其他模型。\n"
                                         "API Key: https://openrouter.ai/settings/keys"
                                     ),
                                 }},
@@ -130,9 +111,6 @@ class FeishuUIMixin:
                 "llm_enabled": False,
                 "openrouter_key": "",
                 "openrouter_model": "",
-                "openrouter_free_model": DEFAULT_MODEL,
-                "openrouter_fallback_models": list(DEFAULT_FALLBACK_MODELS),
-                "openrouter_auto_fallback": True,
             }
 
         def get_page(self) -> List[dict]:
@@ -146,14 +124,14 @@ class FeishuUIMixin:
                     uptime = f"{hours}h {mins}m {secs}s"
 
                 feishu_ok = getattr(self, "_feishu_ok", False)
-                agent_active = bool(self._llm_enabled and self._openrouter_key)
+                agent_active = bool(self._llm_enabled and self._openrouter_key and self._openrouter_model)
                 model = self._get_ai_status_model()
 
                 ws_status = "未启用"
                 if self._use_ws:
                     if not _HAS_LARK_SDK:
                         ws_status = "SDK 未安装"
-                    elif getattr(self, "_ws_connected", False):
+                    elif self._ws_transport is not None and self._ws_transport.connected:
                         ws_status = "✅ 已连接"
                     elif self._ws_running:
                         ws_status = "🔄 连接中"

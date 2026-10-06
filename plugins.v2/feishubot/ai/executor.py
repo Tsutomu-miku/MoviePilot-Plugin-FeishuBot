@@ -2,6 +2,7 @@
 
 import json as _json
 from typing import Optional
+from uuid import uuid4
 from app.log import logger
 
 from .types import ToolResult, ChatState
@@ -20,6 +21,10 @@ class ToolExecutor:
     def __init__(self, state: ChatState):
         self.state = state
         self._extract_tags = None  # 注入: utils._extract_tags
+        self._turn_id = None
+
+    def begin_turn(self):
+        self._turn_id = uuid4().hex
 
     def bind(self, *, extract_tags=None):
         """注入外部依赖"""
@@ -53,6 +58,8 @@ class ToolExecutor:
         """搜索影视信息"""
         if not keyword:
             return ToolResult(success=False, error="请提供搜索关键词")
+        self.state.replace_media([])
+        self.state.replace_resources([])
         try:
             from app.chain.media import MediaChain
             from app.schemas.types import MediaType
@@ -89,7 +96,7 @@ class ToolExecutor:
                 })
 
             # 缓存到 state
-            self.state.search_cache = medias[:8]
+            self.state.replace_media(medias[:8])
             return ToolResult(success=True, data={"keyword": keyword, "total_found": len(medias), "results": valid})
 
         except Exception as e:
@@ -100,6 +107,8 @@ class ToolExecutor:
         """搜索种子资源"""
         if not keyword:
             return ToolResult(success=False, error="请提供搜索关键词")
+        # Failed/empty searches also invalidate the previous list and selection.
+        self.state.replace_resources([])
         try:
             from app.chain.media import MediaChain
             from app.chain.search import SearchChain
@@ -141,7 +150,7 @@ class ToolExecutor:
                 })
 
             # 缓存到 state
-            self.state.resource_cache = contexts[:20]
+            self.state.replace_resources(contexts[:20])
             return ToolResult(success=True, data={
                 "keyword": keyword, "title": title,
                 "total_found": len(contexts), "showing": len(results),
@@ -152,24 +161,28 @@ class ToolExecutor:
             logger.error(f"search_resources 异常: {e}", exc_info=True)
             return ToolResult(success=False, error=str(e))
 
-    def _do_download_resource(self, index: int = 0, confirmed: bool = False, **_) -> ToolResult:
+    def _do_download_resource(self, index: int = 0, confirmed: bool = False,
+                              search_id: str = "", selection_id: str = "", **_) -> ToolResult:
         """下载资源 — 两阶段确认"""
+        if (not isinstance(index, int) or isinstance(index, bool)
+                or not isinstance(confirmed, bool)):
+            return ToolResult(success=False, error="资源序号和确认参数格式错误。")
         cached = self.state.resource_cache
+        if search_id and search_id != self.state.resource_search_id:
+            return ToolResult(success=False, error="这张资源卡片已过期，请使用最新搜索结果。")
 
         if confirmed:
             # ── 阶段二：执行下载 ──
             pending = self.state.pending_download
-            if pending and (index == -1 or index == pending["index"]):
-                index = pending["index"]
-            if not cached:
-                return ToolResult(success=False, error="没有缓存的搜索结果，请先搜索资源。")
-            if index < 0 or index >= len(cached):
-                if pending:
-                    index = pending["index"]
-                else:
-                    return ToolResult(success=False, error=f"序号 {index} 无效且无待确认下载，请先选择资源。")
-
-            ctx = cached[index]
+            if not pending:
+                return ToolResult(success=False, error="没有待确认下载，请先选择资源。")
+            if self._turn_id is not None and pending.get("created_turn") == self._turn_id:
+                return ToolResult(success=False, error="请先展示资源详情，等待用户下一条消息确认。")
+            if (pending.get("search_id") != self.state.resource_search_id
+                    or (index != -1 and index != pending["index"])
+                    or (selection_id and selection_id != pending["selection_id"])):
+                return ToolResult(success=False, error="下载选择已变化，请重新预览并确认。")
+            ctx = pending["context"]
             t = getattr(ctx, "torrent_info", None)
             title = getattr(t, "title", "未知") if t else "未知"
 
@@ -187,9 +200,8 @@ class ToolExecutor:
 
                 from app.chain.download import DownloadChain
                 result = DownloadChain().download_single(context=ctx, userid="feishu")
-                self.state.clear_download()
-
                 if result:
+                    self.state.clear_download()
                     return ToolResult(success=True, data={"title": title, "message": f"✅ 已添加下载: {title}"})
                 else:
                     return ToolResult(success=False, error=f"下载提交失败: {title}")
@@ -211,11 +223,13 @@ class ToolExecutor:
             site = getattr(t, "site_name", "未知") if t else "未知"
             extract = self._extract_tags or (lambda x: {})
 
-            self.state.pending_download = {"index": index, "title": title, "size": size, "site": site}
+            pending = self.state.select_resource(index)
+            pending["created_turn"] = self._turn_id
 
             return ToolResult(success=True, data={
                 "status": "pending_confirmation",
                 "index": index, "title": title, "size": size, "site": site,
+                "selection_id": pending["selection_id"],
                 "tags": extract(title),
                 "message": (
                     f"资源「{title}」（{site}, {size}）等待用户确认。"
@@ -280,7 +294,7 @@ class ToolExecutor:
         """获取下载列表"""
         try:
             from app.chain.download import DownloadChain
-            torrents = DownloadChain().downloading_torrents()
+            torrents = DownloadChain().downloading()
             if not torrents:
                 return ToolResult(success=True, data={"tasks": [], "message": "当前没有正在下载的任务"})
             tasks = []

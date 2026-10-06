@@ -1,6 +1,5 @@
 """Feishu bot inbound routing helpers."""
 
-import threading
 import time as _time
 from typing import Any, Dict, List
 
@@ -32,17 +31,16 @@ class FeishuRoutingMixin:
                     logger.info("飞书 URL 验证请求")
                     return {"challenge": data.get("challenge", "")}
 
-                self._ensure_runtime_ready()
+                if not self._enabled or not self._ensure_runtime_ready():
+                    return {"code": 0}
 
-                if data.get("type") == "card.action.trigger":
+                if evt_type == "card.action.trigger":
                     return self._handle_card_action(data)
 
                 header = data.get("header", {})
                 event = data.get("event", {})
                 if header.get("event_type") == "im.message.receive_v1":
-                    threading.Thread(
-                        target=self._handle_message, args=(event,), daemon=True
-                    ).start()
+                    self._enqueue_message(event)
                 return {"code": 0}
             except Exception as e:
                 logger.error(f"飞书回调处理异常: {e}", exc_info=True)
@@ -60,11 +58,7 @@ class FeishuRoutingMixin:
                 sender = event.get("sender", {}).get("sender_id", {})
                 user_id = sender.get("open_id", "")
 
-                self._ensure_runtime_ready()
-
-                # ── 消息去重: 同一条消息只处理一次 (防止 WS + HTTP 双通道重复) ──
-                if not self._record_message_once(msg_id):
-                    logger.info(f"[去重] 跳过重复消息 {msg_id}")
+                if not self._ensure_runtime_ready():
                     return
 
                 if msg_type != "text":
@@ -83,6 +77,8 @@ class FeishuRoutingMixin:
                 session_key = self._session_key(chat_id, user_id)
                 trace_id = self._build_trace_id("msg", session_key, msg_id)
                 engine = self._get_or_create_engine(session_key)
+                if engine is not None:
+                    engine.executor.begin_turn()
                 is_agent = engine is not None
                 try:
                     self._msg_count = getattr(self, "_msg_count", 0) + 1
@@ -99,14 +95,7 @@ class FeishuRoutingMixin:
                     f"engine={type(engine).__name__ if engine else 'None'}"
                 )
 
-                if not self._try_acquire_global_processing(session_key, msg_id):
-                    if self._feishu:
-                        self._feishu.send_text(chat_id, "⏳", reply_msg_id=msg_id)
-                    return
-
-                release_after_handle = True
-
-                if self._handle_system_text_command(text, engine, chat_id, msg_id):
+                if self._handle_system_text_command(text, engine, chat_id, msg_id, session_key):
                     return
 
                 if self._handle_quick_text_action(text, engine, chat_id, msg_id, session_key):
@@ -122,12 +111,7 @@ class FeishuRoutingMixin:
                         f"[Agent] 收到消息 (#{self._agent_count}, trace={trace_id}, session={session_key}): {text[:80]}"
                     )
 
-                    release_after_handle = False
-                    threading.Thread(
-                        target=self._agent_handle_v2,
-                        args=(session_key, text, chat_id, msg_id),
-                        daemon=True,
-                    ).start()
+                    self._agent_handle_v2(session_key, text, chat_id, msg_id)
                     return
 
                 # ── 传统模式 ──
@@ -139,13 +123,6 @@ class FeishuRoutingMixin:
                 self._legacy_handle(text, chat_id, msg_id, user_id)
             except Exception as _exc:
                 logger.error(f"_handle_message 顶层异常: {_exc}", exc_info=True)
-            finally:
-                if locals().get("release_after_handle"):
-                    self._release_global_processing(
-                        locals().get("session_key", ""),
-                        locals().get("msg_id", ""),
-                    )
-
         def _agent_handle_v2(self, session_key: str, text: str, chat_id: str, msg_id: str):
             """
             Agent 处理方法 — 全局单线程模式。
@@ -154,9 +131,9 @@ class FeishuRoutingMixin:
             trace_id = self._build_trace_id("agent", session_key, msg_id)
             if engine is None:
                 logger.error(f"[Agent] 会话引擎不可用: trace={trace_id}, session={session_key}")
-                self._release_global_processing(session_key, msg_id)
                 return
 
+            generation = self._generation
             _t0 = _time.monotonic()
 
             # ── 即时反馈 ──
@@ -178,7 +155,7 @@ class FeishuRoutingMixin:
                     from ..ai.tools import friendly_tool_name
                     friendly = friendly_tool_name(tool_name, tool_args)
                     step_log_display.append(friendly)
-                    if status_msg_id and self._feishu:
+                    if self._is_dispatch_active(generation) and status_msg_id and self._feishu:
                         try:
                             progress_card = _CardBuilder.agent_tool_progress_card(
                                 text, step_log_display[:-1], step_log_display[-1]
@@ -192,6 +169,8 @@ class FeishuRoutingMixin:
                     on_tool_start=on_tool_start,
                 )
 
+                if not self._is_dispatch_active(generation):
+                    return
                 elapsed = _time.monotonic() - _t0
                 if reply:
                     final_card = _CardBuilder.agent_reply_card(reply, elapsed)
@@ -208,6 +187,8 @@ class FeishuRoutingMixin:
 
             except Exception as e:
                 logger.error(f"Agent 异常: {e}", exc_info=True)
+                if not self._is_dispatch_active(generation):
+                    return
                 error_card = _CardBuilder.error_card(f"AI 处理出错: {e}")
                 if status_msg_id:
                     self._feishu.update_card(status_msg_id, error_card)
@@ -216,4 +197,3 @@ class FeishuRoutingMixin:
             finally:
                 _elapsed = _time.monotonic() - _t0
                 logger.info(f"[Agent] 完成: trace={trace_id}, session={session_key}, elapsed={_elapsed:.1f}s")
-                self._release_global_processing(session_key, msg_id)

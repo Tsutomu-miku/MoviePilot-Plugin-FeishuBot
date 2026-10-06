@@ -72,16 +72,11 @@ class ChatHistory:
         if len(self._messages) <= MAX_HISTORY_MESSAGES:
             return
 
-        cut = len(self._messages) - MAX_HISTORY_MESSAGES
-
-        # 向后移动截断点，找到安全位置（user 或无 tool_calls 的 assistant）
-        while cut < len(self._messages):
-            msg = self._messages[cut]
-            role = msg.get("role", "")
-            if role == "user":
-                break
-            if role == "assistant" and not msg.get("tool_calls"):
-                break
-            cut += 1
-
+        target = len(self._messages) - MAX_HISTORY_MESSAGES
+        turns = [i for i, msg in enumerate(self._messages) if msg.get("role") == "user"]
+        if not turns:
+            return
+        # A current turn may exceed the soft limit. Keep it intact until the
+        # next user turn rather than orphaning/dropping its tool results.
+        cut = next((i for i in turns if i >= target), turns[-1])
         self._messages = self._messages[cut:]

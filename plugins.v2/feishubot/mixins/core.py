@@ -9,10 +9,10 @@ from typing import Any, Callable, List, Optional, Tuple
 from app.log import logger
 
 from ..ai import ChatEngine
-from ..ai.llm import DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, normalize_model_name
+from ..ai.llm import normalize_model_name
 from ..ai.types import ChatState
 from ..card_builder import _CardBuilder
-from ..state import bind_engine_state, ensure_state, sync_state_cache
+from ..state import bind_engine_state, sync_state_cache
 from ..utils import _extract_tags
 
 
@@ -28,87 +28,42 @@ class FeishuCoreMixin:
             return bool(value)
 
         @staticmethod
-        def _parse_str_list_config(value: Any) -> List[str]:
-            if isinstance(value, list):
-                items = value
-            elif isinstance(value, str):
-                items = re.split(r"[,;\n]", value)
-            elif value is None:
-                items = []
-            else:
-                items = [value]
-
-            result = []
-            seen = set()
-            for item in items:
-                normalized = str(item or "").strip()
-                if not normalized or normalized in seen:
-                    continue
-                result.append(normalized)
-                seen.add(normalized)
-            return result
-
-        def _get_ai_model_chain(self) -> List[str]:
-            primary = normalize_model_name(
-                self._openrouter_model or self._openrouter_free_model or DEFAULT_MODEL
-            ) or DEFAULT_MODEL
-            fallback_models = self._parse_str_list_config(self._openrouter_fallback_models)
-            if not fallback_models and self._openrouter_auto_fallback:
-                fallback_models = list(DEFAULT_FALLBACK_MODELS)
-
-            chain = []
-            for model in [primary] + fallback_models:
-                model = normalize_model_name(model)
-                if model and model not in chain:
-                    chain.append(model)
-            return chain or [DEFAULT_MODEL]
-
-        @staticmethod
         def _session_key(chat_id: str, user_id: str) -> str:
-            return "single_user"
+            # Replies and quoted messages stay in the same chat/user session.
+            return _json.dumps([chat_id, user_id], ensure_ascii=False)
 
         def _get_or_create_engine(self, session_key: str) -> Optional[ChatEngine]:
-            if not (self._llm_enabled and self._openrouter_key):
+            if not (self._llm_enabled and self._openrouter_key and self._openrouter_model):
                 return None
-
             if self._engines is None:
                 self._engines = {}
             if self._engine_pool_lock is None:
-                self._engine_pool_lock = threading.Lock()
-
+                self._engine_pool_lock = threading.RLock()
             with self._engine_pool_lock:
                 engine = self._engines.get(session_key)
-                if engine is not None:
-                    return self._bind_shared_state(engine)
-                engine = self._create_chat_engine()
-                self._engines[session_key] = engine
-                logger.info(f"[Agent] 创建会话引擎: session={session_key}")
+                if engine is None:
+                    engine = self._create_chat_engine(session_key)
+                    self._engines[session_key] = engine
                 return engine
 
-        def _bind_shared_state(self, engine: ChatEngine) -> ChatEngine:
-            return bind_engine_state(engine, self._get_session_state())
-
-        def _create_chat_engine(self) -> ChatEngine:
-            model_chain = self._get_ai_model_chain()
-            engine = ChatEngine(
-                api_key=self._openrouter_key,
-                model=model_chain[0],
-                fallback_models=model_chain[1:],
-                auto_fallback=self._openrouter_auto_fallback,
-            )
-            self._bind_shared_state(engine)
+        def _create_chat_engine(self, session_key: str) -> ChatEngine:
+            engine = ChatEngine(api_key=self._openrouter_key, model=self._openrouter_model)
+            bind_engine_state(engine, self._get_session_state(session_key))
             engine.executor.bind(extract_tags=_extract_tags)
             return engine
 
-        def _get_session_state(self) -> ChatState:
-            self._shared_state = ensure_state(self._shared_state)
-            return self._shared_state
+        def _get_session_state(self, session_key: str = "") -> ChatState:
+            if self._session_states is None:
+                self._session_states = {}
+            if self._engine_pool_lock is None:
+                self._engine_pool_lock = threading.RLock()
+            with self._engine_pool_lock:
+                return self._session_states.setdefault(session_key, ChatState())
 
         def _get_ai_status_model(self) -> str:
-            if self._engines:
-                for engine in self._engines.values():
-                    return engine.resolved_model_name
-            return self._get_ai_model_chain()[0]
+            for engine in (self._engines or {}).values():
+                return engine.resolved_model_name
+            return self._openrouter_model or "未配置"
 
         @classmethod
         def _is_direct_confirm_text(cls, text: str) -> bool:
@@ -205,7 +160,7 @@ class FeishuCoreMixin:
             resource_cache: Optional[list] = None,
         ) -> ChatState:
             return sync_state_cache(
-                self._get_session_state(),
+                self._get_session_state(session_key),
                 search_cache=search_cache,
                 resource_cache=resource_cache,
             )
@@ -216,14 +171,17 @@ class FeishuCoreMixin:
             engine: Optional[ChatEngine],
             chat_id: str,
             msg_id: str,
+            session_key: str = "",
         ) -> bool:
             if text.startswith("/status") or text.startswith("/状态"):
-                self._cmd_status(chat_id, msg_id)
+                self._cmd_status(chat_id, msg_id, state=engine.state if engine else self._get_session_state(session_key))
                 return True
 
             if text in ("/clear", "/清除", "清除对话", "重新开始"):
                 if engine:
                     engine.reset()
+                else:
+                    self._get_session_state(session_key).clear_all()
                 self._reply_notify(chat_id, msg_id, "🗑️ 对话已清除", "历史会话已重置，可以开始新的对话。", "green")
                 return True
 
@@ -254,20 +212,7 @@ class FeishuCoreMixin:
             func: Callable,
             *args,
         ) -> bool:
-            if not self._try_acquire_global_processing(session_key, token):
-                logger.info(f"[Busy] 忽略并发任务: task={task_name}, session={session_key}")
-                return False
-
-            def runner():
-                try:
-                    func(*args)
-                except Exception as exc:
-                    logger.error(f"{task_name} 执行异常: {exc}", exc_info=True)
-                finally:
-                    self._release_global_processing(session_key, token)
-
-            threading.Thread(target=runner, daemon=True).start()
-            return True
+            return self._enqueue_task(func, *args)
 
         def _try_handle_cached_index_action(
             self,
@@ -287,7 +232,7 @@ class FeishuCoreMixin:
                 self._reply_error(chat_id, msg_id, message)
                 return True
 
-            state = engine.state if engine is not None else self._get_session_state()
+            state = engine.state if engine is not None else self._get_session_state(session_key)
             if action == "download":
                 if not state.resource_cache:
                     message = "当前没有可用的资源列表上下文，请先搜索资源后再发送“下载11号”。"
@@ -325,6 +270,7 @@ class FeishuCoreMixin:
                         data.get("site", "未知"),
                         data.get("size", "未知"),
                         data.get("tags", {}),
+                        selection_id=data.get("selection_id", ""),
                     ),
                     msg_id,
                 )
@@ -372,6 +318,7 @@ class FeishuCoreMixin:
 
                 for session_key in stale_keys:
                     engine = self._engines.pop(session_key, None)
+                    self._session_states.pop(session_key, None)
                     if engine is not None:
                         try:
                             engine.reset()
@@ -425,7 +372,7 @@ class FeishuCoreMixin:
             msg_id: str,
             session_key: str = "",
         ) -> bool:
-            state = engine.state if engine is not None else self._get_session_state()
+            state = engine.state if engine is not None else self._get_session_state(session_key)
             if state is None:
                 return False
 

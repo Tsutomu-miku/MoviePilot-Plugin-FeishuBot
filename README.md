@@ -1,258 +1,85 @@
-# MoviePilot-Plugin-FeishuBot
+# MoviePilot 飞书机器人
 
-<p align="center">
-  <strong>MoviePilot 飞书机器人双向通信插件</strong>
-</p>
-<p align="center">
-  基于飞书 WebSocket 长连接 · 无需公网 IP · 支持影视搜索与订阅下载
-</p>
+通过飞书长连接搜索影视、筛选资源、确认下载、订阅和查看下载状态，无需公网回调地址。使用 MoviePilot 内部 Chain 与官方 `lark-oapi` SDK。
 
----
+## 安装与配置
 
-## ✨ 特性
+1. 在飞书创建企业自建应用，启用机器人并记录 App ID、App Secret。
+2. 在事件与回调中选择“使用长连接接收”，订阅 `im.message.receive_v1`；使用卡片按钮时配置 `card.action.trigger` 回调。
+3. 开通消息读取、以机器人身份发送消息等权限并发布应用。
+4. 在 MoviePilot 添加仓库 `https://github.com/Tsutomu-miku/MoviePilot-Plugin-FeishuBot`，安装飞书机器人。
+5. 确保容器安装 `lark-oapi`，填写应用凭据并启用长连接。
+6. 如需 AI 对话，填写 OpenRouter API Key 和模型 ID。只使用填写的模型；没有内置免费模型候选，也不会自动切换模型。
 
-- **WebSocket 长连接** — 参考 [OpenClaw](https://github.com/nicepkg/openclaw) 方案，使用飞书官方长连接协议，NAS 部署无需公网 IP、无需域名、无需反向代理
-- **双向通信** — 在飞书中搜索影视、订阅、查看下载进度，系统通知自动推送
-- **交互式卡片** — 搜索结果以富文本卡片展示，回复序号快捷操作
-- **自动重连** — 断线自动重连，服务稳定运行
-- **双引擎** — 优先使用官方 `lark-oapi` SDK，未安装时自动退化为内置 WebSocket 客户端
+通知会话 ID 用于指定系统通知的接收会话，可以留空；交互回复使用收到消息的会话 ID。
 
-## 🏗️ 架构
+从 6.0.x 首次更新到 6.1.0 后，需要重启一次 MoviePilot，清除旧版本已经遗留的连接。仅重载插件无法接管旧版本没有登记的 SDK 线程。6.1.0 之后的重载会主动取消旧循环、关闭连接和退出线程，并拒绝旧实例回调。
 
-```
-┌────────────┐     WebSocket (长连接)      ┌─────────────────┐
-│  飞书客户端  │ ◄═══════════════════════► │  飞书开放平台     │
-│  (手机/PC)  │                            │  (事件推送服务)   │
-└────────────┘                            └────────┬────────┘
-                                                   │ WSS 长连接
-                                                   ▼
-                                          ┌─────────────────┐
-                                          │  MoviePilot NAS  │
-                                          │  (FeishuBot插件)  │
-                                          │                   │
-                                          │  ┌─────────────┐  │
-                                          │  │ WS 客户端    │  │ ← 主动连接，无需公网
-                                          │  └──────┬──────┘  │
-                                          │         │         │
-                                          │  ┌──────▼──────┐  │
-                                          │  │ 命令处理器   │  │
-                                          │  └──────┬──────┘  │
-                                          │         │         │
-                                          │  ┌──────▼──────┐  │
-                                          │  │ MediaChain   │  │ ← 调用 MoviePilot 内部 API
-                                          │  │ SearchChain  │  │
-                                          │  │ SubChain     │  │
-                                          │  └─────────────┘  │
-                                          └───────────────────┘
+旧配置里已经选择的模型会迁移为普通“模型名称”，保留原值。免费模型选择和后备池配置会移除；若模型不可用，需要修改模型名称。
+
+## 使用
+
+AI 模式可以连续发送：
+
+```text
+下载电影《某电影》
+需要 4K、5.1 声道
+下载1号
+确认下载
 ```
 
-**对比传统 Webhook 方案：**
+新消息会按到达顺序排队，不会因为上一条仍在处理而丢失。文字选择、引用回复和卡片点击使用同一会话状态；引用不同消息不会创建额外会话。同一个聊天中的不同用户、同一用户在不同聊天中的对话分别保存。
 
-| 对比项 | Webhook 方案 | WebSocket 长连接 (本插件) |
-|--------|-------------|---------------------------|
-| 公网 IP | ✅ 必须 | ❌ 不需要 |
-| 域名 + HTTPS | ✅ 必须 | ❌ 不需要 |
-| 反向代理 | ✅ 需要 Nginx 等 | ❌ 不需要 |
-| NAT 穿透 | ✅ 需要 frp 等 | ❌ 不需要 |
-| 连接方向 | 飞书 → 你的服务器 | 你的服务器 → 飞书 |
-| NAS 友好度 | ⭐ | ⭐⭐⭐⭐⭐ |
+| 命令 | 用途 |
+| --- | --- |
+| `/搜索 片名` | 传统模式搜索影视 |
+| `/订阅 片名` | 添加订阅 |
+| `/正在下载` | 查看下载 |
+| `下载1号` | 预览最新资源列表的第 1 项 |
+| `确认下载` | 提交当前待确认的资源 |
+| `取消下载` | 清除当前待确认选择 |
+| `订阅2` | 订阅最新影视列表的第 2 项 |
+| `/clear`、`重新开始` | 重置当前会话的历史和选择 |
+| `/status` | 查看运行状态 |
+| `/help` | 查看帮助 |
 
-## 📋 支持的命令
+对话历史闲置一小时后清理。消息及卡片使用一个串行工作队列，因此长请求可能让后续消息等待；不支持多用户并行下载对话。队列最多保存 100 个待处理请求，满时明确提示重试。
 
-| 命令 | 别名 | 说明 |
-|------|------|------|
-| `/search <关键词>` | `/s`, `/搜索` | 搜索影视，返回结果卡片 |
-| `/subscribe <关键词>` | `/sub`, `/订阅` | 订阅影视，自动搜索下载 |
-| `/downloading` | `/dl`, `/下载中` | 查看下载中的任务和进度 |
-| `/help` | `/h`, `/帮助` | 显示帮助信息 |
-| 直接发送文字 | — | 自动作为关键词搜索 |
-| `订阅1` / `订阅2` | — | 快捷订阅搜索结果 |
-| `下载1` / `下载2` | — | 快捷搜索资源下载 |
+## 下载选择与上下文
 
-## 🚀 安装配置
+搜索结果、待确认选择和历史属于同一个 chat/user 会话。
 
-### 第一步：创建飞书应用
+- 预览绑定具体资源对象和唯一选择 ID，不只保存容易变化的序号。
+- 新搜索（包括空结果或搜索失败）使旧资源列表、旧待确认选择失效。
+- 旧资源卡片、旧确认卡片不能操作新搜索结果；需要重新选择。
+- 卡片点击的搜索、选择、确认、取消结果写入 AI 历史。
+- 确认只能提交当前已预览的资源，成功提交后清除选择。
+- 下载失败保留选择，允许重试；不会把失败显示为成功。
 
-1. 登录 [飞书开放平台](https://open.feishu.cn/app/)，点击「创建企业自建应用」
-2. 记录 **App ID** 和 **App Secret**
+内部工具使用从 0 开始的索引，用户可见编号从 1 开始。AI 推荐必须保持原始编号。模型解析仍可能有误，因此下载前应核对资源详情。
 
-### 第二步：配置事件订阅（长连接模式）
+## 开发与验证
 
-1. 进入应用 → **事件与回调**
-2. **加密策略**：选择任意策略（长连接模式下不需要 Verification Token）
-3. **事件推送方式**：选择 **「使用长连接接收」**
-4. 点击「添加事件」，搜索并订阅：
-   - `im.message.receive_v1` — 接收消息
-
-### 第三步：配置权限
-
-进入 **权限管理**，开通以下权限：
-
-| 权限 | 说明 |
-|------|------|
-| `im:message` | 获取与发送单聊、群组消息 |
-| `im:message:send_as_bot` | 以应用身份发送消息 |
-| `im:chat` | 获取群信息（可选） |
-
-### 第四步：发布应用
-
-1. 进入 **版本管理与发布** → 创建版本 → 申请发布
-2. 管理员审批通过后，应用即可使用
-
-### 第五步：安装插件
-
-**方式一：添加自定义插件仓库**
-
-在 MoviePilot 设置中添加插件仓库地址：
-
-```
-https://github.com/Tsutomu-miku/MoviePilot-Plugin-FeishuBot
-```
-
-**方式二：环境变量**
-
-```env
-PLUGIN_MARKET=https://github.com/Tsutomu-miku/MoviePilot-Plugin-FeishuBot
-```
-
-### 第六步：配置插件
-
-在 MoviePilot 插件市场安装「飞书机器人」，填入：
-
-- **App ID** — 飞书应用的 App ID
-- **App Secret** — 飞书应用的 App Secret
-- **默认会话 ID** — 可留空，首次收到消息时自动记录
-
-启用插件后，WebSocket 长连接会自动建立。
-
-## 🔧 工作原理
-
-```
-1. 插件启动 → POST /callback/ws/endpoint (app_id + app_secret)
-      ↓
-2. 获取 WSS 地址 → wss://xxx?device_id=yyy&service_id=zzz
-      ↓
-3. 建立 WebSocket 连接 ← 插件主动连接，可穿越 NAT
-      ↓
-4. 收到 Protobuf 帧 → 解析事件 → 处理消息 → 回复 ACK
-      ↓
-5. 通过飞书 HTTP API 发送消息/卡片给用户
-```
-
-**双引擎模式：**
-- **SDK 模式**：如果已安装 `lark-oapi` 包，自动使用官方 SDK 的 WebSocket 客户端
-- **内置模式**：未安装 SDK 时，使用内置 `websocket-client` 实现连接
-
-推荐在 MoviePilot 的 Docker 中预装 SDK：
 ```bash
-pip install lark-oapi
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q plugins.v2/feishubot
 ```
 
-## 🤖 Agent 模式技术方案
+回归覆盖 FIFO 连续消息、引用回复、按会话隔离、跨搜索确认、旧卡片失效、卡片和文字混用、完整工具历史、停止后的迟到回调及连接关闭。测试替换 MoviePilot、飞书 API 和模型调用，不发起真实下载。
 
-### 多轮下载确认流程
+长连接 SDK 的停止适配集中在 `transport.py`：官方 SDK 使用模块级事件循环且没有公共停止方法，适配器取消循环任务并调用其断开连接操作。更换 SDK 版本时应重新运行连接生命周期测试。
 
-Agent 模式下，用户通过自然语言完成「搜索 → 选择 → 确认下载」三步交互。每一步都是独立的用户消息，触发独立的 Agent 循环。核心挑战是**跨消息保持上下文**。
+## 6.1.0
 
-#### 数据流
+- 关闭旧连接和事件循环，防止重载后多个实例分担同一段对话。
+- 取消停止实例的 AI 任务，拒绝迟到回调，移除自动复活运行时的逻辑。
+- 文字和卡片统一排队处理，保留连续补充的条件。
+- 按聊天及用户隔离历史和资源缓存。
+- 统一 AI 与卡片工具实现，修复卡片调用旧 MoviePilot 搜索方法的问题。
+- 绑定资源快照和卡片选择，修复确认后提交了另一部电影的问题。
+- 工具调用及结果一次写入历史，裁剪保留完整用户轮次。
+- 删除免费模型选择、固定候选池和自动后备切换。
 
-```
-用户消息 1: "下载电影 xxx"
-│
-├─ Agent Loop ─► search_resources("xxx")
-│                  └─► _resource_cache[user] = [ctx0, ctx1, ...]
-│                  └─► LLM 回复推荐列表
-├─ 保存对话历史 ✓
-│
-用户消息 2: "选择第3个"
-│
-├─ Agent Loop ─► download_resource(index=3, confirmed=false)
-│                  └─► _pending_download[user] = {index:3, title:...}
-│                  └─► LLM 回复资源详情，询问确认
-├─ 保存对话历史 ✓
-│
-用户消息 3: "确认下载"
-│
-├─ Agent Loop ─► download_resource(index=-1, confirmed=true)
-│                  └─► 从 _pending_download[user] 取回 index=3
-│                  └─► 补充 media_info (如缺失)
-│                  └─► DownloadChain.download_single(ctx)
-│                  └─► 清除 _pending_download[user]
-├─ 保存对话历史 ✓
-```
+## 许可证
 
-#### 解决的问题
-
-| 问题 | 原因 | 解决方案 |
-|------|------|----------|
-| v6.0.9 | 移除免费模型别名兼容逻辑：不再把旧模型名自动重写到新模型，配置里填什么模型就按什么模型请求；当前可用免费模型列表和默认后备模型保持不变 |
-| v6.0.8 | 根据 OpenRouter 官方 `models` 接口更新免费模型列表：移除已退役的 `google/gemini-2.0-flash-exp:free`，新增当前可用的 `qwen/qwen3.6-plus:free`、`minimax/minimax-m2.5:free`、`z-ai/glm-4.5-air:free`、`nvidia/nemotron-3-super-120b-a12b:free`、`openai/gpt-oss-120b:free` 等，并同步更新默认后备模型与旧模型别名兼容 |
-| v6.0.7 | 修复 Agent 进度回调导入路径错误：`routing.py` 中将错误的 `mixins.ai` 相对导入改为上级 `ai` 子包，解决 `No module named 'app.plugins.feishubot.mixins.ai'` |
-| v6.0.6 | 增强兼容性与回归保障：飞书 Token 获取新增响应校验与过期时间兜底，避免旧环境因异常 `expire` 值或错误响应导致取 Token 失败；同时补充免费模型别名 / Token 缓存回归测试 |
-| v6.0.5 | 修复单用户场景下的重复回复与上下文丢失：统一 direct reply / 引用回复 / 卡片按钮到单一会话上下文，新增 `下载11号` / `订阅2` 等序号直达状态机，并为 `message_id` 去重增加线程锁 |
-| v6.0.4 | 修复机器人并发与 Token 获取问题：处理中的新消息仅回复 `⏳` 并直接丢弃，避免排队后延迟再次回复；同时补充 `timedelta` 导入，修复获取飞书 Token 时 `name 'timedelta' is not defined` |
-| v6.0.3 | 修复免费模型 `qwen/qwen3-4b:free` 下线后的 HTTP 404 问题：自动迁移到当前可用的免费 Qwen 模型，更新默认后备模型池，并在 OpenRouter 返回 404 时继续尝试后备模型 |
-| v6.0.2 | 修复多轮确认上下文与重复回复问题：按 `chat_id + user_id` 隔离会话，改为 FIFO 消息队列，确认/取消短路到待确认下载状态机，并为确认下载/订阅增加短期幂等保护与 trace 日志 |
-| v6.0.1 | 修复 AI 配置与免费模型未生效问题：新增免费模型候选、自动降级与统一模型链初始化，并补充 `.gitignore` 忽略 Python 缓存文件 |
-| 确认下载时 Agent 不知道要下载哪个 | 用户消息 3 触发新 Agent 循环，LLM 可能丢失上下文 | `_pending_download` 缓存：confirmed=false 时记住用户选择，confirmed=true 时 index=-1 自动回溯 |
-| 打断导致对话历史丢失 | 用户连续发消息触发打断机制，被打断的消息不保存历史 | 打断时仍保存已完成的对话上下文，后续消息可获得完整历史 |
-| download_resource 报错 NoneType | `SearchChain.search_by_title` 返回的 Context 不含 `media_info`，但 `DownloadChain.download_single` 访问 `context.media_info.category` | confirmed=true 执行前检测并调用 `MediaChain.recognize_media` 补充 |
-
-#### 关键状态存储
-
-| 存储 | 类型 | 生命周期 | 作用 |
-|------|------|----------|------|
-| `_resource_cache[user_id]` | `List[Context]` | search_resources 时写入 | 保存搜索到的种子资源列表 |
-| `_pending_download[user_id]` | `dict{index,title,...}` | confirmed=false 时写入，confirmed=true 后清除 | 记住用户待确认的下载选择 |
-| `_conversations` | `ConversationManager` | 每次 agent_handle 完成后保存 | 多轮对话历史（含 tool_calls） |
-| `_search_cache[user_id]` | `List[MediaInfo]` | search_media 时写入 | 保存影视搜索结果 |
-
-### 并发控制（打断 + 合并）
-
-```
-用户快速发送多条消息:
-
-msg_1 ──┐
-msg_2 ──┤  合并窗口 (1.5s)
-msg_3 ──┘
-         ↓
-    取最新消息 msg_3 开始处理
-         ↓
-    处理中... ← msg_4 到达 → 标记打断 + 存储 msg_4
-         ↓
-    当前轮次完成 → 保存已完成对话历史
-         ↓
-    检测到打断 → 取 msg_4 继续处理
-```
-
-## 📁 目录结构
-
-```
-MoviePilot-Plugin-FeishuBot/
-├── plugins.v2/
-│   └── feishubot/
-│       └── __init__.py       # 插件主代码
-├── icons/
-│   └── feishu.png            # 插件图标
-├── package.v2.json           # 插件元数据
-├── LICENSE                   # MIT License
-└── README.md                 # 本文件
-```
-
-## 📋 更新日志
-
-| 版本 | 更新内容 |
-|------|----------|
-| v5.2.0 | 修复 Agent 多轮下载确认上下文丢失：新增 `_pending_download` 状态缓存 + 打断时保存对话历史 + `media_info` 补充识别 |
-| v5.1.3 | 修复执行错误导致的异常关闭 |
-| v5.1.1 | Agent 并发修复 + 下载容错增强 + System Prompt 上下文理解指令 |
-| v5.1.0 | 消息去重(msg_id幂等) + 并发竞态修复 + 即时反馈增强 + 卡片样式优化 |
-| v5.0.0 | Agent 并发控制重构 + 即时反馈卡片 + 飞书交互式卡片全面升级 |
-| v4.0.0 | 新增 WebSocket 长连接收消息，替代已失效的 HTTP 回调方式 |
-| v3.0.0 | 新增 Agent 智能对话模式 |
-| v2.0.0 | 新增搜索、订阅、下载等交互指令 |
-| v1.0.0 | 初始版本：飞书机器人消息通知 |
-
-## 📝 许可证
-
-[MIT License](LICENSE)
+MIT，见 [LICENSE](LICENSE)。

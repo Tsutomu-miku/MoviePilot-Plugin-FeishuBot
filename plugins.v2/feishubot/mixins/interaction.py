@@ -1,6 +1,10 @@
 """Feishu bot legacy commands, cards, and diagnostics helpers."""
 
 import re
+import json
+
+from ..ai.executor import ToolExecutor
+from ..utils import _extract_tags
 from datetime import datetime
 
 from app.log import logger
@@ -11,146 +15,37 @@ from ..utils import _HAS_LARK_SDK
 
 
 class FeishuInteractionMixin:
+        def _run_legacy_tool(self, name, args, session_key):
+            executor = ToolExecutor(self._get_session_state(session_key))
+            executor.bind(extract_tags=_extract_tags)
+            result = executor.execute(name, args)
+            if not result.success:
+                return {"error": result.error}
+            return dict(result.data or {}, success=True)
+
         def _legacy_tool_search_media(self, keyword: str, session_key: str = "") -> dict:
-            """传统模式: 搜索影视"""
-            try:
-                from app.chain.search import SearchChain
-                results = SearchChain().search_medias(title=keyword)
-                if not results:
-                    return {"results": [], "message": f"未找到与 '{keyword}' 相关的内容"}
-
-                self._sync_engine_cache(session_key, search_cache=results[:10])
-
-                items = []
-                for i, m in enumerate(results[:10]):
-                    items.append({
-                        "index": i,
-                        "title": m.title or "未知",
-                        "year": m.year or "",
-                        "type": m.type.value if m.type else "未知",
-                        "rating": m.vote_average or 0,
-                        "overview": (m.overview or "")[:100],
-                    })
-                return {"results": items, "total": len(results), "keyword": keyword}
-            except Exception as e:
-                return {"error": str(e)}
+            result = self._run_legacy_tool("search_media", {"keyword": keyword}, session_key)
+            result["search_id"] = self._get_session_state(session_key).media_search_id
+            return result
 
         def _legacy_tool_search_resources(self, keyword: str, session_key: str = "") -> dict:
-            """传统模式: 搜索资源"""
-            try:
-                from app.chain.search import SearchChain
-                contexts = SearchChain().search_torrents(title=keyword)
-                if not contexts:
-                    return {"results": [], "message": f"未找到 '{keyword}' 的下载资源"}
+            result = self._run_legacy_tool("search_resources", {"keyword": keyword}, session_key)
+            result["search_id"] = self._get_session_state(session_key).resource_search_id
+            return result
 
-                self._sync_engine_cache(session_key, resource_cache=contexts[:15])
+        def _legacy_tool_download_resource(self, index: int, confirmed: bool = False,
+                                           session_key: str = "", search_id: str = "",
+                                           selection_id: str = "") -> dict:
+            return self._run_legacy_tool("download_resource", {
+                "index": index, "confirmed": confirmed,
+                "search_id": search_id, "selection_id": selection_id,
+            }, session_key)
 
-                items = []
-                for i, ctx in enumerate(contexts[:15]):
-                    t = ctx.torrent_info
-                    items.append({
-                        "index": i,
-                        "title": t.title or "未知",
-                        "site": t.site_name or "未知",
-                        "size": f"{t.size / (1024**3):.1f} GB" if t.size else "未知",
-                        "seeders": t.seeders or 0,
-                    })
-                return {"results": items, "total": len(contexts), "title": keyword}
-            except Exception as e:
-                return {"error": str(e)}
+        def _legacy_tool_subscribe_media(self, keyword=None, idx=None, session_key=""):
+            return self._run_legacy_tool("subscribe_media", {"keyword": keyword, "index": idx}, session_key)
 
-        def _legacy_tool_download_resource(
-            self,
-            index: int,
-            confirmed: bool = False,
-            session_key: str = "",
-        ) -> dict:
-            """传统模式: 下载资源"""
-            try:
-                from app.chain.download import DownloadChain
-                state = self._get_session_state()
-                cache = state.resource_cache
-                if not cache:
-                    return {"error": "没有可用的资源缓存，请先搜索资源"}
-                if index < 0 or index >= len(cache):
-                    pending = state.pending_download
-                    if confirmed and pending:
-                        index = pending.get("index", index)
-                    else:
-                        return {"error": f"索引 {index} 超出范围 (0-{len(cache)-1})"}
-                ctx = cache[index]
-                t = ctx.torrent_info
-                if not confirmed:
-                    state.pending_download = {
-                        "index": index,
-                        "title": t.title or "未知",
-                        "site": t.site_name or "未知",
-                        "size": f"{t.size / (1024**3):.1f} GB" if t.size else "未知",
-                    }
-                    return {
-                        "title": t.title or "未知",
-                        "site": t.site_name or "未知",
-                        "size": f"{t.size / (1024**3):.1f} GB" if t.size else "未知",
-                        "tags": {"seeders": t.seeders or 0},
-                    }
-                DownloadChain().download_single(ctx)
-                state.clear_download()
-                return {"success": True, "message": f"已添加下载: {t.title}"}
-            except Exception as e:
-                return {"error": str(e)}
-
-        def _legacy_tool_subscribe_media(
-            self,
-            keyword: str = None,
-            idx: int = None,
-            session_key: str = "",
-        ) -> dict:
-            """传统模式: 订阅"""
-            try:
-                from app.chain.search import SearchChain
-                from app.chain.subscribe import SubscribeChain
-                from app.chain.media import MediaChain
-                state = self._get_session_state()
-                if idx is not None and state.search_cache:
-                    cache = state.search_cache
-                    if 0 <= idx < len(cache):
-                        item = cache[idx]
-                        info = MediaChain().recognize_media(meta=item)
-                        if info and info.tmdb_info:
-                            SubscribeChain().add(title=info.title, year=info.year,
-                                                 mtype=info.type, tmdbid=info.tmdb_id)
-                            return {"success": True, "message": f"已订阅: {info.title}"}
-                    return {"error": f"索引 {idx} 对应的内容未找到"}
-                if keyword:
-                    results = SearchChain().search_medias(title=keyword)
-                    if results:
-                        m = results[0]
-                        info = MediaChain().recognize_media(meta=m)
-                        if info and info.tmdb_info:
-                            SubscribeChain().add(title=info.title, year=info.year,
-                                                 mtype=info.type, tmdbid=info.tmdb_id)
-                            return {"success": True, "message": f"已订阅: {info.title}"}
-                    return {"error": f"未找到可订阅的内容: {keyword}"}
-                return {"error": "请提供关键词或索引"}
-            except Exception as e:
-                return {"error": str(e)}
-
-        def _legacy_tool_get_downloading(self) -> dict:
-            """传统模式: 查看下载"""
-            try:
-                from app.chain.download import DownloadChain
-                torrents = DownloadChain().downloading_torrents()
-                if not torrents:
-                    return {"tasks": [], "message": "当前没有正在下载的任务"}
-                tasks = []
-                for t in torrents[:15]:
-                    tasks.append({
-                        "title": getattr(t, "title", "") or getattr(t, "name", "未知"),
-                        "progress": getattr(t, "progress", 0),
-                    })
-                return {"tasks": tasks, "total": len(torrents)}
-            except Exception as e:
-                return {"error": str(e)}
+        def _legacy_tool_get_downloading(self):
+            return self._run_legacy_tool("get_downloading", {}, "")
 
         def _legacy_handle(self, text: str, chat_id: str, msg_id: str, user_id: str):
             # ── v5.1.1: 即时反馈 ──
@@ -198,7 +93,7 @@ class FeishuInteractionMixin:
                 )
                 return
             # 使用搜索结果卡片
-            self._feishu.send_card(chat_id, _CardBuilder.search_result_card(keyword, items))
+            self._feishu.send_card(chat_id, _CardBuilder.search_result_card(keyword, items, search_id=result.get("search_id", "")))
 
         def _legacy_subscribe(self, keyword: str, chat_id: str, msg_id: str, user_id: str):
             if not keyword:
@@ -224,9 +119,9 @@ class FeishuInteractionMixin:
             total = result.get("total", len(tasks))
             self._feishu.send_card(chat_id, _CardBuilder.downloading_card(tasks, total))
 
-        def _cmd_status(self, chat_id: str, msg_id: str):
+        def _cmd_status(self, chat_id: str, msg_id: str, state=None):
             model = self._get_ai_status_model()
-            cache_media, cache_res = cache_counts(self._get_session_state())
+            cache_media, cache_res = cache_counts(state) if state is not None else (0, 0)
 
             uptime = "未知"
             if hasattr(self, "_init_ts") and self._init_ts:
@@ -239,7 +134,7 @@ class FeishuInteractionMixin:
             if self._use_ws:
                 if not _HAS_LARK_SDK:
                     ws_status = "⚠️ SDK 未安装"
-                elif self._ws_connected:
+                elif self._ws_transport is not None and self._ws_transport.connected:
                     ws_status = "✅ 已连接"
                 elif self._ws_running:
                     ws_status = "🔄 连接中"
@@ -285,88 +180,44 @@ class FeishuInteractionMixin:
             )
 
         def _handle_card_action(self, data: dict) -> dict:
-            try:
-                self._cleanup_recent_actions()
-                action = data.get("event", {}).get("action", {})
-                value = action.get("value", {})
-                act = value.get("action", "")
-                operator = data.get("event", {}).get("operator", {})
-                user_id = operator.get("open_id", "")
-                ctx = data.get("event", {}).get("context", {})
-                chat_id = ctx.get("open_chat_id", "") or self._chat_id
-                session_key = self._session_key(chat_id, user_id)
-                callback_token = (
-                    data.get("header", {}).get("event_id", "")
-                    or data.get("event", {}).get("context", {}).get("open_message_id", "")
-                )
-                trace_id = self._build_trace_id("card", session_key, callback_token)
-                logger.info(f"[Card] 收到回调: trace={trace_id}, session={session_key}, action={act}")
-
-                if act == "download_resource":
-                    idx = int(value.get("index", 0))
-                    self._dispatch_serial_task(
-                        session_key,
-                        callback_token,
-                        "card_download",
-                        self._card_download,
-                        idx,
-                        user_id,
-                        chat_id,
-                    )
-                elif act == "download_resource_confirm":
-                    idx = int(value.get("index", 0))
-                    action_key = f"card_confirm::{session_key}::{idx}"
-                    if not self._mark_action_once(action_key):
-                        logger.info(f"[Card] 忽略重复下载确认: trace={trace_id}, session={session_key}, index={idx}")
-                        return {"code": 0}
-                    self._dispatch_serial_task(
-                        session_key,
-                        callback_token,
-                        "card_download_confirmed",
-                        self._card_download_confirmed,
-                        idx,
-                        user_id,
-                        chat_id,
-                    )
-                elif act == "subscribe":
-                    idx = int(value.get("index", 0))
-                    action_key = f"card_subscribe::{session_key}::{idx}"
-                    if not self._mark_action_once(action_key):
-                        logger.info(f"[Card] 忽略重复订阅: trace={trace_id}, session={session_key}, index={idx}")
-                        return {"code": 0}
-                    self._dispatch_serial_task(
-                        session_key,
-                        callback_token,
-                        "card_subscribe",
-                        self._card_subscribe,
-                        idx,
-                        user_id,
-                        chat_id,
-                    )
-                elif act == "search_resources_by_title":
-                    kw = value.get("keyword", "")
-                    self._dispatch_serial_task(
-                        session_key,
-                        callback_token,
-                        "card_search_resources",
-                        self._card_search_resources,
-                        kw,
-                        user_id,
-                        chat_id,
-                    )
-                elif act == "noop":
-                    pass
-            except Exception as e:
-                logger.error(f"卡片回调异常: {e}", exc_info=True)
+            if not self._enabled or not self._ensure_runtime_ready():
+                return {"code": 0}
+            event = data.get("event", {})
+            value = event.get("action", {}).get("value", {})
+            act = value.get("action", "")
+            user_id = event.get("operator", {}).get("open_id", "")
+            ctx = event.get("context", {})
+            chat_id = ctx.get("open_chat_id", "") or self._chat_id
+            session_key = self._session_key(chat_id, user_id)
+            event_id = data.get("header", {}).get("event_id", "") or event.get("token", "")
+            if event_id and not self._record_message_once("card:" + event_id):
+                return {"code": 0}
+            actions = {
+                "download_resource": (self._card_download, (int(value.get("index", 0)), user_id, chat_id, value.get("search_id", ""))),
+                "download_resource_confirm": (self._card_download_confirmed, (int(value.get("index", 0)), user_id, chat_id, value.get("selection_id", ""))),
+                "cancel_download": (self._card_cancel, (user_id, chat_id, value.get("selection_id", ""))),
+                "subscribe": (self._card_subscribe, (int(value.get("index", 0)), user_id, chat_id, value.get("search_id", ""))),
+                "search_resources_by_title": (self._card_search_resources, (value.get("keyword", ""), user_id, chat_id)),
+            }
+            task = actions.get(act)
+            if task and not self._enqueue_task(task[0], *task[1]):
+                self._reply_error(chat_id, "", "消息队列已满，请稍后重试。")
+                if event_id:
+                    with self._seen_msg_ids_lock:
+                        self._seen_msg_ids.pop("card:" + event_id, None)
             return {"code": 0}
 
-        def _card_download(self, idx: int, user_id: str, chat_id: str):
+        def _card_download(self, idx: int, user_id: str, chat_id: str, search_id: str = ""):
             """卡片按钮: 展示下载确认"""
             session_key = self._session_key(chat_id, user_id)
-            result = self._legacy_tool_download_resource(idx, confirmed=False, session_key=session_key)
+            if not search_id:
+                self._reply_error(chat_id, "", "这张旧资源卡片已过期，请重新搜索。")
+                return
+            result = self._legacy_tool_download_resource(idx, confirmed=False, session_key=session_key, search_id=search_id)
             if result.get("error"):
                 self._feishu.send_card(chat_id, _CardBuilder.error_card(result["error"]))
                 return
+            self._record_card_history(session_key, f"选择第 {idx + 1} 项资源", result)
             self._feishu.send_card(
                 chat_id,
                 _CardBuilder.download_confirm_card(
@@ -375,13 +226,18 @@ class FeishuInteractionMixin:
                     result.get("site", "未知"),
                     result.get("size", "未知"),
                     result.get("tags", {}),
+                    selection_id=result.get("selection_id", ""),
                 ),
             )
 
-        def _card_download_confirmed(self, idx: int, user_id: str, chat_id: str):
+        def _card_download_confirmed(self, idx: int, user_id: str, chat_id: str, selection_id: str = ""):
             """卡片按钮: 确认下载"""
             session_key = self._session_key(chat_id, user_id)
-            result = self._legacy_tool_download_resource(idx, confirmed=True, session_key=session_key)
+            if not selection_id:
+                self._reply_error(chat_id, "", "这张旧确认卡片已过期，请重新选择资源。")
+                return
+            result = self._legacy_tool_download_resource(idx, confirmed=True, session_key=session_key, selection_id=selection_id)
+            self._record_card_history(session_key, "确认下载选中的资源", result)
             msg = result.get("message") or result.get("error", "操作失败")
             if result.get("success"):
                 self._feishu.send_card(
@@ -391,9 +247,13 @@ class FeishuInteractionMixin:
             else:
                 self._feishu.send_card(chat_id, _CardBuilder.error_card(msg))
 
-        def _card_subscribe(self, idx: int, user_id: str, chat_id: str):
+        def _card_subscribe(self, idx: int, user_id: str, chat_id: str, search_id: str = ""):
             session_key = self._session_key(chat_id, user_id)
+            if not search_id or search_id != self._get_session_state(session_key).media_search_id:
+                self._reply_error(chat_id, "", "这张影视卡片已过期，请重新搜索。")
+                return
             result = self._legacy_tool_subscribe_media(None, idx=idx, session_key=session_key)
+            self._record_card_history(session_key, f"订阅第 {idx + 1} 部作品", result)
             msg = result.get("message") or result.get("error", "操作失败")
             if result.get("success"):
                 self._feishu.send_card(
@@ -414,6 +274,25 @@ class FeishuInteractionMixin:
             if result.get("error"):
                 self._feishu.send_card(chat_id, _CardBuilder.error_card(result["error"]))
                 return
+            self._record_card_history(session_key, f"搜索「{keyword}」的资源", result)
             items = result.get("results", [])
             title = result.get("title", keyword)
-            self._feishu.send_card(chat_id, _CardBuilder.resource_result_card(keyword, title, items))
+            self._feishu.send_card(chat_id, _CardBuilder.resource_result_card(keyword, title, items, search_id=result.get("search_id", "")))
+
+        def _record_card_history(self, session_key, user_text, result):
+            engine = self._get_or_create_engine(session_key)
+            # Result contains only the public view, never Context credentials/URLs.
+            self._append_history_pair(engine, user_text, json.dumps(result, ensure_ascii=False, default=str))
+
+        def _card_cancel(self, user_id, chat_id, selection_id):
+            session_key = self._session_key(chat_id, user_id)
+            state = self._get_session_state(session_key)
+            pending = state.pending_download
+            if not pending or not selection_id or pending.get("selection_id") != selection_id:
+                self._reply_error(chat_id, "", "这张确认卡片已过期。")
+                return
+            title = pending.get("title", "未知资源")
+            state.clear_download()
+            result = {"message": f"已取消下载: {title}"}
+            self._record_card_history(session_key, "取消下载", result)
+            self._reply_notify(chat_id, "", "已取消", result["message"], "grey")

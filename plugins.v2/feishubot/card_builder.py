@@ -123,7 +123,7 @@ class _CardBuilder:
         return cls.wrap("🤖 处理进度", elements, template="turquoise")
 
     @classmethod
-    def search_result_card(cls, keyword: str, results: list) -> dict:
+    def search_result_card(cls, keyword: str, results: list, search_id: str = "") -> dict:
         """搜索结果卡片 — 多列信息密度布局"""
         if not results:
             return cls.wrap("🔍 搜索结果", [cls._md(f"未找到「{keyword}」相关结果")], template="grey")
@@ -152,7 +152,7 @@ class _CardBuilder:
 
             # 操作按钮
             btns = [
-                cls._button("📥 订阅", {"action": "subscribe", "index": item.get("index", 0)}, "primary"),
+                cls._button("📥 订阅", {"action": "subscribe", "index": item.get("index", 0), "search_id": search_id}, "primary"),
                 cls._button("🔍 搜资源", {"action": "search_resources_by_title", "keyword": title}, "default"),
             ]
             elements.append(cls._action(btns))
@@ -163,7 +163,7 @@ class _CardBuilder:
         return cls.wrap("🔍 搜索结果", elements, template="blue")
 
     @classmethod
-    def resource_result_card(cls, keyword: str, title: str, results: list) -> dict:
+    def resource_result_card(cls, keyword: str, title: str, results: list, search_id: str = "") -> dict:
         """资源列表卡片 — 标签化 + 高信息密度"""
         if not results:
             return cls.wrap("📦 资源搜索", [cls._md(f"未找到「{title}」的下载资源")], template="grey")
@@ -207,7 +207,7 @@ class _CardBuilder:
 
             # 下载按钮
             elements.append(cls._action([
-                cls._button(f"⬇️ 下载 #{idx}", {"action": "download_resource", "index": item.get("index", 0)}, "primary"),
+                cls._button(f"⬇️ 下载 #{idx}", {"action": "download_resource", "index": item.get("index", 0), "search_id": search_id}, "primary"),
             ]))
 
             if idx < len(results):
@@ -216,7 +216,7 @@ class _CardBuilder:
         return cls.wrap("📦 资源列表", elements, template="green")
 
     @classmethod
-    def download_confirm_card(cls, index: int, title: str, site: str, size: str, tags: dict) -> dict:
+    def download_confirm_card(cls, index: int, title: str, site: str, size: str, tags: dict, selection_id: str = "") -> dict:
         """下载确认卡片"""
         tag_parts = []
         for k in ("resolution", "video_codec", "hdr", "audio", "source"):
@@ -229,8 +229,8 @@ class _CardBuilder:
             cls._hr(),
             cls._md("⚠️ **确认下载此资源？**"),
             cls._action([
-                cls._button("✅ 确认下载", {"action": "download_resource_confirm", "index": index}, "primary"),
-                cls._button("❌ 取消", {"action": "noop"}, "danger"),
+                cls._button("✅ 确认下载", {"action": "download_resource_confirm", "index": index, "selection_id": selection_id}, "primary"),
+                cls._button("❌ 取消", {"action": "cancel_download", "selection_id": selection_id}, "danger"),
             ]),
         ]
         return cls.wrap("⬇️ 下载确认", elements, template="orange")
