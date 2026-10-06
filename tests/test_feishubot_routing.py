@@ -156,9 +156,10 @@ class FeishuBotRoutingTests(unittest.TestCase):
         sys.modules.pop("app.chain", None)
         sys.modules.pop("app.chain.download", None)
         sys.modules.pop("app.chain.search", None)
+        sys.modules.pop("app.chain.media", None)
 
-    def test_single_session_key_is_constant(self):
-        self.assertEqual(
+    def test_chat_and_user_have_separate_sessions(self):
+        self.assertNotEqual(
             FeishuBot._session_key("chat_a", "user_a"),
             FeishuBot._session_key("chat_b", "user_b"),
         )
@@ -171,22 +172,13 @@ class FeishuBotRoutingTests(unittest.TestCase):
         self.assertTrue(bot._record_message_once("msg-1"))
         self.assertFalse(bot._record_message_once("msg-1"))
 
-    def test_dispatch_serial_task_respects_busy_gate(self):
+    def test_dispatch_serial_task_uses_the_message_queue(self):
         bot = FeishuBot()
         calls = []
-
-        bot._try_acquire_global_processing = lambda session_key, token: False
-        bot._release_global_processing = lambda session_key, token: calls.append(("release", session_key, token))
-
-        dispatched = bot._dispatch_serial_task(
-            "single_user",
-            "token",
-            "demo_task",
-            lambda: calls.append(("run",)),
-        )
-
-        self.assertFalse(dispatched)
-        self.assertEqual(calls, [])
+        bot._enqueue_task = lambda function, *args: calls.append((function, args)) or True
+        task = lambda: None
+        self.assertTrue(bot._dispatch_serial_task("chat::user", "event", "demo", task, 1))
+        self.assertEqual(calls, [(task, (1,))])
 
     def test_extract_message_text_strips_mentions(self):
         msg = {
@@ -261,7 +253,7 @@ class FeishuBotRoutingTests(unittest.TestCase):
         )
         self.assertIn("当前没有可用的资源列表上下文", engine.history.messages[1]["content"])
 
-    def test_legacy_search_populates_shared_engine_cache(self):
+    def test_legacy_search_populates_session_cache(self):
         class _SearchChain:
             @staticmethod
             def search_medias(title=""):
@@ -272,11 +264,12 @@ class FeishuBotRoutingTests(unittest.TestCase):
                         type=types.SimpleNamespace(value="movie"),
                         vote_average=8.5,
                         overview="overview",
+                        tmdb_id=1,
                     )
                 ]
 
             @staticmethod
-            def search_torrents(title=""):
+            def search_by_title(title=""):
                 torrent = types.SimpleNamespace(
                     title=f"{title} 4K",
                     site_name="站点",
@@ -290,19 +283,22 @@ class FeishuBotRoutingTests(unittest.TestCase):
         search_module.SearchChain = _SearchChain
         sys.modules["app.chain"] = chain_module
         sys.modules["app.chain.search"] = search_module
+        media_module = types.ModuleType("app.chain.media")
+        media_module.MediaChain = lambda: types.SimpleNamespace(search=lambda **kw: (None, _SearchChain.search_medias(**kw)))
+        sys.modules["app.chain.media"] = media_module
 
         bot = FeishuBot()
-        bot._shared_state = PLUGIN_MODULE.ChatState()
+        state = bot._get_session_state("single_user")
 
         media_result = bot._legacy_tool_search_media("测试电影", session_key="single_user")
         resource_result = bot._legacy_tool_search_resources("测试电影", session_key="single_user")
 
         self.assertEqual(media_result["results"][0]["title"], "测试电影 A")
-        self.assertEqual(resource_result["results"][0]["title"], "测试电影 4K")
-        self.assertEqual(len(bot._shared_state.search_cache), 1)
-        self.assertEqual(len(bot._shared_state.resource_cache), 1)
+        self.assertEqual(resource_result["results"][0]["title"], "测试电影 A 4K")
+        self.assertEqual(len(state.search_cache), 1)
+        self.assertEqual(len(state.resource_cache), 1)
 
-    def test_cached_download_can_use_shared_state_without_engine(self):
+    def test_cached_download_can_use_session_state_without_engine(self):
         class _DownloadChain:
             @staticmethod
             def download_single(_ctx):
@@ -316,8 +312,8 @@ class FeishuBotRoutingTests(unittest.TestCase):
 
         bot = FeishuBot()
         bot._feishu = _FakeFeishu()
-        bot._shared_state = PLUGIN_MODULE.ChatState()
-        bot._shared_state.resource_cache = [
+        state = bot._get_session_state("single_user")
+        state.resource_cache = [
             types.SimpleNamespace(
                 torrent_info=types.SimpleNamespace(
                     title="测试资源",
@@ -341,45 +337,12 @@ class FeishuBotRoutingTests(unittest.TestCase):
             bot._feishu.calls[-1]["card"]["header"]["title"]["content"],
             "⬇️ 下载确认",
         )
-        self.assertEqual(bot._shared_state.pending_download["index"], 0)
+        self.assertEqual(state.pending_download["index"], 0)
 
-    def test_model_chain_keeps_explicit_model_name_without_alias_rewrite(self):
-        self.assertEqual(
-            LLM_MODULE.normalize_model_name("qwen/qwen3-4b:free"),
-            "qwen/qwen3-4b:free",
-        )
-        client = LLM_MODULE.LLMClient(
-            api_key="test-key",
-            model="qwen/qwen3-4b:free",
-            fallback_models=["qwen/qwen3-4b:free", "openrouter/free"],
-            auto_fallback=False,
-        )
-        self.assertEqual(
-            client.model_chain,
-            ["qwen/qwen3-4b:free", "openrouter/free"],
-        )
-
-    def test_free_model_defaults_track_current_openrouter_choices(self):
-        option_values = [item["value"] for item in LLM_MODULE.FREE_MODEL_CHOICES]
-        self.assertIn("qwen/qwen3.6-plus:free", option_values)
-        self.assertIn("minimax/minimax-m2.5:free", option_values)
-        self.assertIn("z-ai/glm-4.5-air:free", option_values)
-        self.assertIn("nvidia/nemotron-3-super-120b-a12b:free", option_values)
-        self.assertIn("openai/gpt-oss-120b:free", option_values)
-        self.assertNotIn("google/gemini-2.0-flash-exp:free", option_values)
-        self.assertEqual(
-            LLM_MODULE.normalize_model_name("google/gemini-2.0-flash-exp:free"),
-            "google/gemini-2.0-flash-exp:free",
-        )
-        self.assertEqual(
-            LLM_MODULE.DEFAULT_FALLBACK_MODELS[:4],
-            [
-                "qwen/qwen3.6-plus:free",
-                "minimax/minimax-m2.5:free",
-                "stepfun/step-3.5-flash:free",
-                "z-ai/glm-4.5-air:free",
-            ],
-        )
+    def test_model_name_is_not_rewritten(self):
+        client = LLM_MODULE.LLMClient(api_key="test-key", model="vendor/my-model")
+        self.assertEqual(client.primary_model, "vendor/my-model")
+        self.assertEqual(LLM_MODULE.DEFAULT_MODEL, "")
 
     def test_feishu_token_fetch_sets_cached_expiry(self):
         class _FakeResponse:
@@ -423,7 +386,6 @@ class FeishuBotRoutingTests(unittest.TestCase):
         bot = FeishuBot()
         bot._feishu = _FakeFeishu()
         bot._get_or_create_engine = lambda _session_key: _ProgressEngine()
-        bot._release_global_processing = lambda _session_key, _msg_id: None
         bot._build_trace_id = lambda *_args: "trace"
 
         bot._agent_handle_v2("single_user", "流浪地球", "chat-id", "msg-id")
@@ -433,16 +395,17 @@ class FeishuBotRoutingTests(unittest.TestCase):
         self.assertEqual(bot._feishu.updated[0]["message_id"], "status_msg")
         self.assertEqual(bot._feishu.updated[-1]["message_id"], "status_msg")
 
-    def test_get_form_uses_current_free_model_defaults(self):
+    def test_form_has_only_an_explicit_model_field(self):
+        import json
         bot = FeishuBot()
-        _form, defaults = bot.get_form()
+        form, defaults = bot.get_form()
+        body = json.dumps(form)
+        self.assertIn('openrouter_model', body)
+        self.assertNotIn('openrouter_free_model', body)
+        self.assertNotIn('openrouter_fallback_models', body)
+        self.assertNotIn('openrouter_auto_fallback', body)
+        self.assertEqual(defaults["openrouter_model"], "")
 
-        self.assertEqual(defaults["openrouter_free_model"], "openrouter/free")
-        self.assertIn("qwen/qwen3.6-plus:free", defaults["openrouter_fallback_models"])
-        self.assertNotIn(
-            "google/gemini-2.0-flash-exp:free",
-            defaults["openrouter_fallback_models"],
-        )
 
 
 if __name__ == "__main__":

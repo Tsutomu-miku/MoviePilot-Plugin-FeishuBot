@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 from app.plugins import _PluginBase
 
-from .ai.llm import DEFAULT_MODEL
 from .ai.types import ChatState
 from .feishu_api import _FeishuAPI
 from .mixins import (
@@ -29,7 +28,6 @@ class FeishuBot(
     _SESSION_TTL_SECONDS = 3600
     _ACTION_DEDUPE_TTL_SECONDS = 15
     _SEEN_MESSAGE_TTL_SECONDS = 300
-    _SINGLE_SESSION_KEY = "single_user"
     _DIRECT_CONFIRM_TEXTS = {
         "确认", "确认下载", "确定", "确定下载", "好的", "好", "下载吧", "好下载吧",
         "行", "行吧", "可以", "可以下载", "开始下载", "继续下载", "是", "是的",
@@ -48,7 +46,7 @@ class FeishuBot(
     plugin_name = "飞书机器人"
     plugin_desc = "飞书群机器人消息通知与交互，支持 AI Agent 智能体模式（WebSocket 长连接）"
     plugin_icon = "Feishu_A.png"
-    plugin_version = "6.0.9"
+    plugin_version = "6.1.0"
     plugin_author = "Tsutomu-miku"
     author_url = "https://github.com/Tsutomu-miku"
     plugin_config_prefix = "feishubot_"
@@ -63,22 +61,19 @@ class FeishuBot(
     _llm_enabled: bool = False
     _openrouter_key: str = ""
     _openrouter_model: str = ""
-    _openrouter_free_model: str = DEFAULT_MODEL
-    _openrouter_fallback_models: list = []
-    _openrouter_auto_fallback: bool = True
     _use_ws: bool = True
 
     _feishu: Optional[_FeishuAPI] = None
     _engines: Optional[dict] = None
-    _shared_state: Optional[ChatState] = None
+    _session_states: Optional[dict] = None
+    _dispatcher: Optional[Any] = None
+    _ws_transport: Optional[Any] = None
+    _stopped: bool = False
+    _generation: int = 0
+    _task_context: Optional[Any] = None
     _engine_pool_lock: Optional[threading.Lock] = None
     _recent_actions: Optional[dict] = None
     _recent_actions_lock: Optional[threading.Lock] = None
     _seen_msg_ids: Optional[dict] = None
     _seen_msg_ids_lock: Optional[threading.Lock] = None
-    _global_processing_lock: Optional[threading.Lock] = None
-    _global_processing: bool = False
-
-    _ws_client: Optional[Any] = None
-    _ws_thread: Optional[threading.Thread] = None
     _ws_running: bool = False

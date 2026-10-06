@@ -1,4 +1,4 @@
-﻿"""
+"""
 AI 对话系统 - ChatEngine 主引擎
 这是 AI 对话系统的唯一入口。外部（__init__.py）只需调用:
     engine = ChatEngine(api_key, model)
@@ -7,7 +7,7 @@ AI 对话系统 - ChatEngine 主引擎
 
 import json as _json
 import threading
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from app.log import logger
 
@@ -50,8 +50,6 @@ class ChatEngine:
         api_key: str,
         model: str = "",
         base_url: str = "",
-        fallback_models: Optional[Iterable[str]] = None,
-        auto_fallback: bool = True,
     ):
         self.state = ChatState()
         self.history = ChatHistory(SYSTEM_PROMPT)
@@ -59,31 +57,18 @@ class ChatEngine:
             api_key=api_key,
             model=model,
             base_url=base_url,
-            fallback_models=fallback_models,
-            auto_fallback=auto_fallback,
         )
         self.executor = ToolExecutor(self.state)
 
         self._lock = threading.Lock()
-        self._pending_messages: List[dict] = []
+        self._cancelled = threading.Event()
 
     @property
     def is_busy(self) -> bool:
         return self.state.is_processing
 
-    def enqueue(self, message: dict):
-        queued = dict(message or {})
-        self._pending_messages.append(queued)
-        text = queued.get("text", "")
-        logger.info(
-            f"ChatEngine: 消息已排队 '{text[:50]}', queue_size={len(self._pending_messages)}"
-        )
-
-    def drain_pending(self) -> Optional[dict]:
-        if not self._pending_messages:
-            return None
-        message = self._pending_messages.pop(0)
-        return message
+    def cancel(self):
+        self._cancelled.set()
 
     def chat(self, text: str) -> str:
         reply, _ = self.chat_with_progress(text)
@@ -101,7 +86,6 @@ class ChatEngine:
     def reset(self):
         self.history.clear()
         self.state.clear_all()
-        self._pending_messages.clear()
         logger.info("ChatEngine: 对话已重置")
 
     @property
@@ -116,14 +100,6 @@ class ChatEngine:
     def configured_model_name(self) -> str:
         return self.llm.primary_model
 
-    @property
-    def fallback_model_names(self) -> List[str]:
-        return list(self.llm.model_chain[1:])
-
-    @property
-    def model_chain(self) -> List[str]:
-        return list(self.llm.model_chain)
-
     def _do_chat(
         self,
         text: str,
@@ -135,6 +111,7 @@ class ChatEngine:
 
         self.state.is_processing = True
         try:
+            self.executor.begin_turn()
             self.history.append({"role": "user", "content": text})
             reply, step_log = self._agent_loop(on_tool_start, on_tool_done)
             return reply, step_log
@@ -149,6 +126,8 @@ class ChatEngine:
         step_log = []
 
         for iteration in range(MAX_TOOL_ROUNDS):
+            if self._cancelled.is_set():
+                return "", step_log
             try:
                 result = self.llm.chat(
                     messages=self.history.to_api_messages(),
@@ -160,6 +139,8 @@ class ChatEngine:
                 self.history.append({"role": "assistant", "content": err})
                 return err, step_log
 
+            if self._cancelled.is_set():
+                return "", step_log
             choices = result.get("choices")
             if not choices:
                 logger.error(f"LLM 无 choices: {_json.dumps(result, ensure_ascii=False)[:500]}")
@@ -181,9 +162,11 @@ class ChatEngine:
                 return reply, step_log
 
             clean_msg = _sanitize_assistant_message(raw_message)
-            self.history.append(clean_msg)
+            tool_messages = []
 
             for tc in tool_calls:
+                if self._cancelled.is_set():
+                    return "", step_log
                 fn_name = tc.get("function", {}).get("name", "")
                 fn_args_raw = tc.get("function", {}).get("arguments", "{}")
                 tc_id = tc.get("id", "")
@@ -205,11 +188,12 @@ class ChatEngine:
                 if on_tool_done:
                     on_tool_done(fn_name, fn_args)
 
-                self.history.append({
+                tool_messages.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
                     "content": tool_result.text,
                 })
+            self.history.extend([clean_msg] + tool_messages)
 
         timeout_msg = "⚠️ 处理步骤过多，请尝试简化请求。"
         self.history.append({"role": "assistant", "content": timeout_msg})

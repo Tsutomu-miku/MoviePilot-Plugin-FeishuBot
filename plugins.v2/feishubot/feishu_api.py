@@ -10,7 +10,8 @@ from app.log import logger
 class _FeishuAPI:
     """飞书 Token 管理 & 消息发送"""
 
-    def __init__(self, app_id, app_secret):
+    def __init__(self, app_id, app_secret, is_active=None):
+        self._is_active = is_active or (lambda: True)
         self._app_id = app_id
         self._app_secret = app_secret
         self._token: str = ""
@@ -60,6 +61,8 @@ class _FeishuAPI:
 
     def send_text(self, chat_id: str, text: str, reply_msg_id: str = None):
         """发送文本消息。提供 reply_msg_id 时使用回复 API。"""
+        if not self._is_active():
+            return {}
         content = _json.dumps({"text": text}, ensure_ascii=False)
 
         if reply_msg_id:
@@ -72,8 +75,11 @@ class _FeishuAPI:
             params = {"receive_id_type": "chat_id"}
 
         try:
+            headers = self._headers()
+            if not self._is_active():
+                return {}
             resp = requests.post(
-                url, params=params, headers=self._headers(),
+                url, params=params, headers=headers,
                 json=body, timeout=10,
             )
             result = resp.json()
@@ -84,6 +90,8 @@ class _FeishuAPI:
 
     def send_card(self, chat_id: str, card: dict, reply_msg_id: str = None):
         """发送卡片消息。支持 reply_msg_id 回复。"""
+        if not self._is_active():
+            return {}
         content = _json.dumps(card, ensure_ascii=False)
 
         if reply_msg_id:
@@ -100,8 +108,11 @@ class _FeishuAPI:
             params = {"receive_id_type": "chat_id"}
 
         try:
+            headers = self._headers()
+            if not self._is_active():
+                return {}
             resp = requests.post(
-                url, params=params, headers=self._headers(),
+                url, params=params, headers=headers,
                 json=body, timeout=10,
             )
             result = resp.json()
@@ -114,14 +125,19 @@ class _FeishuAPI:
 
     def update_card(self, message_id: str, card: dict):
         """更新已发送的卡片消息（用于状态更新）"""
+        if not self._is_active():
+            return {}
         url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
         body = {
             "msg_type": "interactive",
             "content": _json.dumps(card, ensure_ascii=False),
         }
         try:
+            headers = self._headers()
+            if not self._is_active():
+                return {}
             resp = requests.patch(
-                url, headers=self._headers(), json=body, timeout=10,
+                url, headers=headers, json=body, timeout=10,
             )
             result = resp.json()
             if result.get("code") != 0:
